@@ -515,12 +515,14 @@ def align_durations(segments, work_dir):
 
         ratio = actual_dur / target_dur
         aligned_path = os.path.join(aligned_dir, f"aligned_{i:04d}.wav")
-        audio, sr = sf.read(seg["wav_path"])
 
         if 0.99 <= ratio <= 1.01:
-            # Almost identical — use as-is
-            sf.write(aligned_path, audio, sr)
-        elif ratio > 1.0:
+            seg["aligned_path"] = seg["wav_path"]
+            continue
+
+        audio, sr = sf.read(seg["wav_path"])
+
+        if ratio > 1.0:
             # Too long: speed up (no truncation)
             stretch_rate = min(ratio, STRETCH_HARD_LIMIT)
             stretched = pyrb.time_stretch(audio, sr, rate=stretch_rate)
@@ -549,7 +551,6 @@ def _apply_fade(audio, sr):
     fade_len = int(FADE_MS / 1000 * sr)
     fade_len = min(fade_len, len(audio) // 4)
     if fade_len > 0:
-        audio = audio.copy()
         audio[:fade_len] *= np.linspace(0, 1, fade_len, dtype=audio.dtype)
         audio[-fade_len:] *= np.linspace(1, 0, fade_len, dtype=audio.dtype)
     return audio
