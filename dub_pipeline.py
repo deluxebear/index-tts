@@ -6,8 +6,11 @@ Dubs English TED-style speeches into Chinese with:
 - ASR + speaker diarization (whisperx)
 - Context-aware LLM translation (OpenAI-compatible API)
 - Voice cloning + emotion preservation (IndexTTS2)
-- Duration alignment (pyrubberband)
+- Duration alignment with gap absorption (pyrubberband)
+- Crossfade between segments
 - Final video assembly (ffmpeg)
+- SRT subtitle output (CN + EN)
+- Checkpoint/resume on interruption
 
 Usage:
     # Single video
@@ -15,6 +18,9 @@ Usage:
 
     # Batch mode
     python dub_pipeline.py --batch /path/to/input_dir -o /path/to/output_dir
+
+    # Resume after interruption (auto-detected)
+    python dub_pipeline.py video.mp4  # picks up from last checkpoint
 
 Requires: demucs, whisperx, pyrubberband, soundfile, openai, ffmpeg
 """
@@ -33,8 +39,12 @@ import soundfile as sf
 CHARS_PER_SECOND = 4.5
 STRETCH_MIN = 0.85
 STRETCH_MAX = 1.15
-STRETCH_HARD_LIMIT = 1.3
+STRETCH_HARD_LIMIT = 1.5
 MIN_REF_DURATION = 3.0
+GAP_ABSORB_MAX = 2.0
+BG_VOLUME = 0.3
+FADE_MS = 10
+CHECKPOINT_FILE = "checkpoint.json"
 
 
 def _run_ffmpeg(*args):
@@ -46,6 +56,38 @@ def _run_ffmpeg(*args):
         )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"ffmpeg failed: {e.stderr.decode()}") from e
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint — save/resume pipeline progress
+# ---------------------------------------------------------------------------
+
+def _save_checkpoint(work_dir, step, segments=None, **extra):
+    """Save pipeline progress after each step."""
+    data = {"step": step, "segments": segments}
+    data.update(extra)
+    path = os.path.join(work_dir, CHECKPOINT_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    print(f"  Checkpoint saved: step {step}")
+
+
+def _load_checkpoint(work_dir):
+    """Load checkpoint if exists."""
+    path = os.path.join(work_dir, CHECKPOINT_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    print(f"  Resuming from checkpoint: step {data['step']}")
+    return data
+
+
+def _clear_checkpoint(work_dir):
+    """Remove checkpoint after successful completion."""
+    path = os.path.join(work_dir, CHECKPOINT_FILE)
+    if os.path.exists(path):
+        os.remove(path)
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +120,6 @@ def extract_tracks(video_path, work_dir):
     audio_path = os.path.join(work_dir, "full_audio.wav")
     video_only_path = os.path.join(work_dir, "video_only.mp4")
 
-    # Keep native sample rate — demucs needs 44.1kHz+ for good separation.
-    # Downstream consumers (whisperx, IndexTTS2) resample internally.
     _run_ffmpeg("-i", video_path,
                 "-vn", "-acodec", "pcm_s16le",
                 audio_path)
@@ -150,7 +190,7 @@ def transcribe_and_diarize(vocals_path, hf_token, num_speakers=None):
     print("  Loading Whisper model...")
     model = whisperx.load_model("large-v2", device, compute_type=compute_type)
     result = model.transcribe(vocals_path, batch_size=16)
-    del model  # free GPU memory
+    del model
 
     print("  Aligning words...")
     align_model, metadata = whisperx.load_align_model(
@@ -159,7 +199,7 @@ def transcribe_and_diarize(vocals_path, hf_token, num_speakers=None):
     result = whisperx.align(
         result["segments"], align_model, metadata, vocals_path, device
     )
-    del align_model  # free GPU memory
+    del align_model
 
     print("  Running speaker diarization...")
     from whisperx.diarize import DiarizationPipeline
@@ -177,6 +217,30 @@ def transcribe_and_diarize(vocals_path, hf_token, num_speakers=None):
     segments = result["segments"]
     speakers = set(seg.get("speaker", "UNKNOWN") for seg in segments)
     print(f"  Transcribed {len(segments)} segments, {len(speakers)} speakers: {speakers}")
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# Step 3.5: Gap absorption (Pyvideotrans technique)
+# ---------------------------------------------------------------------------
+
+def absorb_gaps(segments):
+    """Extend each segment's available time by absorbing inter-segment silence.
+
+    Uses 'end_padded' to preserve original 'end' for subtitle accuracy,
+    while giving duration alignment more room to work with.
+    """
+    for i in range(len(segments) - 1):
+        gap = segments[i + 1]["start"] - segments[i]["end"]
+        if 0 < gap <= GAP_ABSORB_MAX:
+            segments[i]["end_padded"] = segments[i + 1]["start"]
+        else:
+            segments[i]["end_padded"] = segments[i]["end"]
+    if segments:
+        segments[-1]["end_padded"] = segments[-1]["end"]
+
+    absorbed = sum(1 for s in segments if s.get("end_padded", s["end"]) > s["end"])
+    print(f"  Absorbed gaps for {absorbed}/{len(segments)} segments")
     return segments
 
 
@@ -207,12 +271,10 @@ def extract_speaker_refs(segments, vocals_path, work_dir, fallback_refs=None):
     os.makedirs(refs_dir, exist_ok=True)
 
     for spk, segs in speakers.items():
-        # Find longest utterance as auto reference
         best_seg = max(segs, key=lambda s: s["end"] - s["start"])
         ref_path = os.path.join(refs_dir, f"ref_{spk}.wav")
         extract_audio_segment(vocals_path, best_seg["start"], best_seg["end"], ref_path)
 
-        # User-provided fallback takes priority
         if fallback_refs and spk in fallback_refs:
             fallback = fallback_refs[spk]
         else:
@@ -268,7 +330,6 @@ def analyze_context(segments, llm_client):
 只返回 JSON，不要解释。"""
 
     response = llm_client.chat(prompt)
-    # Strip markdown code fences if present
     response = re.sub(r"^```(?:json)?\s*", "", response.strip())
     response = re.sub(r"\s*```$", "", response.strip())
     try:
@@ -276,12 +337,8 @@ def analyze_context(segments, llm_client):
     except json.JSONDecodeError:
         print(f"  Warning: Failed to parse context analysis JSON, using defaults")
         return {
-            "topic": "unknown",
-            "domain": "general",
-            "tone": "neutral",
-            "key_terms": {},
-            "speakers": {},
-            "translation_notes": "",
+            "topic": "unknown", "domain": "general", "tone": "neutral",
+            "key_terms": {}, "speakers": {}, "translation_notes": "",
         }
 
 
@@ -292,7 +349,6 @@ def translate_with_context(segments, context, llm_client, batch_size=12):
     for i in range(0, len(segments), batch_size):
         batch = segments[i : i + batch_size]
 
-        # Previous translations as context overlap
         prev_lines = ""
         if translated:
             prev_items = translated[-3:]
@@ -402,19 +458,23 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
             seg["actual_duration"] = 0
             continue
 
-        ref_audio = get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir)
         output_path = os.path.join(tts_dir, f"tts_{i:04d}.wav")
 
-        tts.infer(
-            spk_audio_prompt=ref_audio,
-            text=zh_text,
-            output_path=output_path,
-            emo_audio_prompt=ref_audio,
-            verbose=False,
-        )
-
-        seg["wav_path"] = output_path
-        seg["actual_duration"] = get_audio_duration(output_path)
+        # Skip if already generated (for resume)
+        if os.path.exists(output_path):
+            seg["wav_path"] = output_path
+            seg["actual_duration"] = get_audio_duration(output_path)
+        else:
+            ref_audio = get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir)
+            tts.infer(
+                spk_audio_prompt=ref_audio,
+                text=zh_text,
+                output_path=output_path,
+                emo_audio_prompt=ref_audio,
+                verbose=False,
+            )
+            seg["wav_path"] = output_path
+            seg["actual_duration"] = get_audio_duration(output_path)
 
         target_dur = seg["end"] - seg["start"]
         ratio = seg["actual_duration"] / target_dur if target_dur > 0 else 1.0
@@ -426,11 +486,15 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
 
 
 # ---------------------------------------------------------------------------
-# Step 7: Duration alignment
+# Step 7: Duration alignment (with gap absorption)
 # ---------------------------------------------------------------------------
 
 def align_durations(segments, work_dir):
-    """Align generated audio to target duration using time-stretching."""
+    """Align generated audio to target duration using time-stretching.
+
+    Uses 'end_padded' (from absorb_gaps) for more available time.
+    No hard truncation — prefers aggressive stretching over cutting audio.
+    """
     import pyrubberband as pyrb
 
     aligned_dir = os.path.join(work_dir, "aligned")
@@ -441,7 +505,8 @@ def align_durations(segments, work_dir):
             seg["aligned_path"] = None
             continue
 
-        target_dur = seg["end"] - seg["start"]
+        # Use padded end (with absorbed gap) for more room
+        target_dur = seg.get("end_padded", seg["end"]) - seg["start"]
         actual_dur = seg["actual_duration"]
 
         if target_dur <= 0 or actual_dur <= 0:
@@ -452,18 +517,16 @@ def align_durations(segments, work_dir):
         aligned_path = os.path.join(aligned_dir, f"aligned_{i:04d}.wav")
         audio, sr = sf.read(seg["wav_path"])
 
-        if STRETCH_MIN <= ratio <= STRETCH_MAX:
-            stretched = pyrb.time_stretch(audio, sr, rate=ratio)
-            sf.write(aligned_path, stretched, sr)
-        elif ratio > STRETCH_MAX:
+        if 0.99 <= ratio <= 1.01:
+            # Almost identical — use as-is
+            sf.write(aligned_path, audio, sr)
+        elif ratio > 1.0:
+            # Too long: speed up (no truncation)
             stretch_rate = min(ratio, STRETCH_HARD_LIMIT)
             stretched = pyrb.time_stretch(audio, sr, rate=stretch_rate)
-            max_samples = int(target_dur * sr)
-            if len(stretched) > max_samples:
-                stretched = stretched[:max_samples]
             sf.write(aligned_path, stretched, sr)
         else:
-            # Too short: slow down first, pad remainder with silence if needed
+            # Too short: slow down, pad remainder with silence
             stretched = pyrb.time_stretch(audio, sr, rate=max(ratio, 0.5))
             target_samples = int(target_dur * sr)
             if len(stretched) < target_samples:
@@ -481,6 +544,17 @@ def align_durations(segments, work_dir):
 # Step 8-9: Audio assembly and final video mix
 # ---------------------------------------------------------------------------
 
+def _apply_fade(audio, sr):
+    """Apply fade-in and fade-out to avoid click noise at segment boundaries."""
+    fade_len = int(FADE_MS / 1000 * sr)
+    fade_len = min(fade_len, len(audio) // 4)
+    if fade_len > 0:
+        audio = audio.copy()
+        audio[:fade_len] *= np.linspace(0, 1, fade_len, dtype=audio.dtype)
+        audio[-fade_len:] *= np.linspace(1, 0, fade_len, dtype=audio.dtype)
+    return audio
+
+
 def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_dir):
     """Assemble Chinese speech + background + video into final output."""
     bg_info = sf.info(bg_audio_path)
@@ -493,10 +567,13 @@ def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_d
         if aligned_path is None or not os.path.exists(aligned_path):
             continue
 
-        audio, audio_sr = sf.read(aligned_path)
+        audio, audio_sr = sf.read(aligned_path, dtype="float32")
         if audio_sr != sr:
             import librosa
             audio = librosa.resample(audio, orig_sr=audio_sr, target_sr=sr)
+
+        # Apply fade to avoid click at segment boundaries
+        audio = _apply_fade(audio, sr)
 
         start_sample = int(seg["start"] * sr)
         end_sample = start_sample + len(audio)
@@ -507,19 +584,21 @@ def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_d
             audio = audio[: total_samples - start_sample]
             end_sample = total_samples
 
-        speech_track[start_sample:end_sample] = audio[: end_sample - start_sample]
+        # Additive mix (not overwrite) — handles overlapping segments gracefully
+        speech_track[start_sample:end_sample] += audio[: end_sample - start_sample]
 
     speech_path = os.path.join(work_dir, "chinese_speech.wav")
     sf.write(speech_path, speech_track, sr)
     del speech_track
 
-    # Mix speech + background and merge with video in one ffmpeg call
+    # Mix speech + background (with volume control) and merge with video
     _run_ffmpeg(
         "-i", video_only_path,
         "-i", speech_path,
         "-i", bg_audio_path,
         "-filter_complex",
-        "[1:a][2:a]amix=inputs=2:duration=longest:normalize=0[aout]",
+        f"[1:a]volume=1.0[speech];[2:a]volume={BG_VOLUME}[bg];"
+        "[speech][bg]amix=inputs=2:duration=longest:normalize=0[aout]",
         "-map", "0:v:0", "-map", "[aout]",
         "-c:v", "copy", "-shortest",
         output_path,
@@ -527,6 +606,33 @@ def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_d
 
     print(f"  Final video: {output_path}")
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Step 10: SRT subtitle output
+# ---------------------------------------------------------------------------
+
+def _format_srt_time(seconds):
+    """Convert seconds to SRT time format: HH:MM:SS,mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def generate_srt(segments, output_path, lang="zh"):
+    """Generate SRT subtitle file from segments."""
+    text_key = "zh_text" if lang == "zh" else "text"
+    with open(output_path, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(segments):
+            text = seg.get(text_key, "")
+            if not text.strip():
+                continue
+            start = _format_srt_time(seg["start"])
+            end = _format_srt_time(seg["end"])  # Original end, not end_padded
+            f.write(f"{i + 1}\n{start} --> {end}\n{text}\n\n")
+    print(f"  Saved SRT: {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +652,7 @@ def dub_video(
     num_speakers=None,
     use_fp16=True,
     tts=None,
+    cleanup=False,
 ):
     """
     Main pipeline: dub an English video into Chinese.
@@ -563,62 +670,138 @@ def dub_video(
         num_speakers: Hint for number of speakers (2-4).
         use_fp16: Use FP16 for IndexTTS2 inference.
         tts: Pre-initialized IndexTTS2 instance (for batch mode).
+        cleanup: Delete intermediate files after successful completion.
     """
     video_path = str(video_path)
     if output_path is None:
         stem = Path(video_path).stem
         output_path = str(Path(video_path).parent / f"{stem}_cn.mp4")
 
-    # Per-video work directory
     video_work_dir = os.path.join(work_dir, Path(video_path).stem)
     os.makedirs(video_work_dir, exist_ok=True)
 
     print(f"\n{'=' * 60}")
     print(f"Dubbing: {video_path}")
     print(f"Output:  {output_path}")
+    print(f"Work:    {video_work_dir}")
     print(f"{'=' * 60}")
 
-    print("\n[Step 1/9] Extracting audio and video tracks...")
-    audio_path, video_only_path = extract_tracks(video_path, video_work_dir)
+    # Load checkpoint if resuming
+    ckpt = _load_checkpoint(video_work_dir)
+    done = ckpt["step"] if ckpt else 0
+    segments = ckpt.get("segments") if ckpt else None
+    paths = ckpt.get("paths", {}) if ckpt else {}
 
-    print("\n[Step 2/9] Separating vocals from background...")
-    vocals_path, bg_path = separate_vocals(audio_path, video_work_dir)
+    # --- Step 1: Extract tracks ---
+    if done < 1:
+        print("\n[Step 1/10] Extracting audio and video tracks...")
+        audio_path, video_only_path = extract_tracks(video_path, video_work_dir)
+        paths.update(audio_path=audio_path, video_only_path=video_only_path)
+        _save_checkpoint(video_work_dir, 1, paths=paths)
+    else:
+        audio_path = paths["audio_path"]
+        video_only_path = paths["video_only_path"]
+        print(f"\n[Step 1/10] Skipped (cached)")
 
-    print("\n[Step 3/9] Transcribing and diarizing...")
-    segments = transcribe_and_diarize(vocals_path, hf_token, num_speakers)
+    # --- Step 2: Source separation ---
+    if done < 2:
+        print("\n[Step 2/10] Separating vocals from background...")
+        vocals_path, bg_path = separate_vocals(audio_path, video_work_dir)
+        paths.update(vocals_path=vocals_path, bg_path=bg_path)
+        _save_checkpoint(video_work_dir, 2, paths=paths)
+    else:
+        vocals_path = paths["vocals_path"]
+        bg_path = paths["bg_path"]
+        print(f"\n[Step 2/10] Skipped (cached)")
 
-    transcript_path = os.path.join(video_work_dir, "transcript.json")
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        json.dump(segments, f, ensure_ascii=False, indent=2)
-    print(f"  Saved transcript: {transcript_path}")
+    # --- Step 3: ASR + diarization ---
+    if done < 3:
+        print("\n[Step 3/10] Transcribing and diarizing...")
+        segments = transcribe_and_diarize(vocals_path, hf_token, num_speakers)
+        transcript_path = os.path.join(video_work_dir, "transcript.json")
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            json.dump(segments, f, ensure_ascii=False, indent=2)
+        print(f"  Saved transcript: {transcript_path}")
+        _save_checkpoint(video_work_dir, 3, segments=segments, paths=paths)
+    else:
+        print(f"\n[Step 3/10] Skipped (cached, {len(segments)} segments)")
 
-    print("\n[Step 4/9] Extracting speaker references...")
-    speaker_refs = extract_speaker_refs(segments, vocals_path, video_work_dir, fallback_refs)
+    # --- Step 3.5: Gap absorption ---
+    if done < 4:
+        print("\n[Step 3.5/10] Absorbing inter-segment gaps...")
+        segments = absorb_gaps(segments)
+        _save_checkpoint(video_work_dir, 4, segments=segments, paths=paths)
+    else:
+        print(f"\n[Step 3.5/10] Skipped (cached)")
 
-    print("\n[Step 5/9] Translating to Chinese...")
-    llm_client = LLMClient(api_key=llm_api_key, api_base=llm_api_base, model=llm_model)
-    segments, context = translate_segments(segments, llm_client)
+    # --- Step 4: Speaker references ---
+    if done < 5:
+        print("\n[Step 4/10] Extracting speaker references...")
+        speaker_refs = extract_speaker_refs(segments, vocals_path, video_work_dir, fallback_refs)
+        paths["speaker_refs"] = speaker_refs
+        _save_checkpoint(video_work_dir, 5, segments=segments, paths=paths)
+    else:
+        speaker_refs = paths.get("speaker_refs", {})
+        print(f"\n[Step 4/10] Skipped (cached)")
 
-    translations_path = os.path.join(video_work_dir, "translations.json")
-    with open(translations_path, "w", encoding="utf-8") as f:
-        json.dump(
-            [{"id": i, "speaker": s.get("speaker"), "start": s["start"], "end": s["end"],
-              "en": s["text"], "zh": s.get("zh_text", "")}
-             for i, s in enumerate(segments)],
-            f, ensure_ascii=False, indent=2,
-        )
-    print(f"  Saved translations: {translations_path}")
+    # --- Step 5: Translation ---
+    if done < 6:
+        print("\n[Step 5/10] Translating to Chinese...")
+        llm_client = LLMClient(api_key=llm_api_key, api_base=llm_api_base, model=llm_model)
+        segments, context = translate_segments(segments, llm_client)
+        translations_path = os.path.join(video_work_dir, "translations.json")
+        with open(translations_path, "w", encoding="utf-8") as f:
+            json.dump(
+                [{"id": i, "speaker": s.get("speaker"), "start": s["start"], "end": s["end"],
+                  "en": s["text"], "zh": s.get("zh_text", "")}
+                 for i, s in enumerate(segments)],
+                f, ensure_ascii=False, indent=2,
+            )
+        print(f"  Saved translations: {translations_path}")
+        _save_checkpoint(video_work_dir, 6, segments=segments, paths=paths)
+    else:
+        print(f"\n[Step 5/10] Skipped (cached)")
 
-    print("\n[Step 6/9] Generating Chinese speech with IndexTTS2...")
-    if tts is None:
-        tts = _init_tts(model_dir, use_fp16)
-    segments = generate_speech(segments, speaker_refs, vocals_path, video_work_dir, tts)
+    # --- Step 6: TTS generation ---
+    if done < 7:
+        print("\n[Step 6/10] Generating Chinese speech with IndexTTS2...")
+        if tts is None:
+            tts = _init_tts(model_dir, use_fp16)
+        segments = generate_speech(segments, speaker_refs, vocals_path, video_work_dir, tts)
+        _save_checkpoint(video_work_dir, 7, segments=segments, paths=paths)
+    else:
+        print(f"\n[Step 6/10] Skipped (cached)")
 
-    print("\n[Step 7/9] Aligning durations...")
-    segments = align_durations(segments, video_work_dir)
+    # --- Step 7: Duration alignment ---
+    if done < 8:
+        print("\n[Step 7/10] Aligning durations...")
+        segments = align_durations(segments, video_work_dir)
+        _save_checkpoint(video_work_dir, 8, segments=segments, paths=paths)
+    else:
+        print(f"\n[Step 7/10] Skipped (cached)")
 
-    print("\n[Step 8-9/9] Assembling final video...")
-    assemble_final(segments, bg_path, video_only_path, output_path, video_work_dir)
+    # --- Step 8-9: Assembly ---
+    if done < 9:
+        print("\n[Step 8-9/10] Assembling final video...")
+        assemble_final(segments, bg_path, video_only_path, output_path, video_work_dir)
+        _save_checkpoint(video_work_dir, 9, segments=segments, paths=paths)
+    else:
+        print(f"\n[Step 8-9/10] Skipped (cached)")
+
+    # --- Step 10: SRT subtitles ---
+    print("\n[Step 10/10] Generating subtitles...")
+    srt_base = output_path.rsplit(".", 1)[0]
+    generate_srt(segments, f"{srt_base}.srt", lang="zh")
+    generate_srt(segments, f"{srt_base}_en.srt", lang="en")
+
+    # Mark done
+    _clear_checkpoint(video_work_dir)
+
+    # Cleanup if requested
+    if cleanup:
+        import shutil
+        shutil.rmtree(video_work_dir)
+        print(f"  Cleaned up: {video_work_dir}")
 
     print(f"\nDone! Output: {output_path}")
     return output_path
@@ -673,7 +856,6 @@ def dub_batch(
             results.append((video.name, "FAILED", str(e)))
             continue
 
-    # Summary
     print(f"\n{'=' * 60}")
     print("BATCH SUMMARY")
     print(f"{'=' * 60}")
@@ -708,6 +890,7 @@ def main():
     parser.add_argument("--llm-api-key", default=None, help="LLM API key (or set LLM_API_KEY env var)")
     parser.add_argument("--llm-api-base", default="https://api.openai.com/v1", help="LLM API base URL")
     parser.add_argument("--llm-model", default="gpt-4o-mini", help="LLM model name")
+    parser.add_argument("--cleanup", action="store_true", help="Delete intermediate files after completion")
 
     args = parser.parse_args()
 
@@ -731,6 +914,7 @@ def main():
         model_dir=args.model_dir,
         num_speakers=args.num_speakers,
         use_fp16=use_fp16,
+        cleanup=args.cleanup,
     )
 
     if args.batch:
