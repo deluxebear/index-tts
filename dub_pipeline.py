@@ -518,17 +518,16 @@ def align_durations(segments, work_dir):
 
         if 0.99 <= ratio <= 1.01:
             seg["aligned_path"] = seg["wav_path"]
+            seg["aligned_duration"] = actual_dur
             continue
 
         audio, sr = sf.read(seg["wav_path"])
 
         if ratio > 1.0:
-            # Too long: speed up (no truncation)
             stretch_rate = min(ratio, STRETCH_HARD_LIMIT)
             stretched = pyrb.time_stretch(audio, sr, rate=stretch_rate)
             sf.write(aligned_path, stretched, sr)
         else:
-            # Too short: slow down, pad remainder with silence
             stretched = pyrb.time_stretch(audio, sr, rate=max(ratio, 0.5))
             target_samples = int(target_dur * sr)
             if len(stretched) < target_samples:
@@ -538,6 +537,7 @@ def align_durations(segments, work_dir):
             sf.write(aligned_path, stretched, sr)
 
         seg["aligned_path"] = aligned_path
+        seg["aligned_duration"] = len(stretched) / sr
 
     return segments
 
@@ -623,16 +623,23 @@ def _format_srt_time(seconds):
 
 
 def generate_srt(segments, output_path, lang="zh"):
-    """Generate SRT subtitle file from segments."""
+    """Generate SRT subtitle file aligned to actual dubbed audio timing."""
     text_key = "zh_text" if lang == "zh" else "text"
     with open(output_path, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(segments):
+        idx = 0
+        for seg in segments:
             text = seg.get(text_key, "")
             if not text.strip():
                 continue
-            start = _format_srt_time(seg["start"])
-            end = _format_srt_time(seg["end"])  # Original end, not end_padded
-            f.write(f"{i + 1}\n{start} --> {end}\n{text}\n\n")
+            idx += 1
+            srt_start = seg["start"]
+            # Use aligned duration (post-stretch) so subtitle matches actual speech
+            aligned_dur = seg.get("aligned_duration")
+            if aligned_dur is not None:
+                srt_end = srt_start + aligned_dur
+            else:
+                srt_end = seg["end"]
+            f.write(f"{idx}\n{_format_srt_time(srt_start)} --> {_format_srt_time(srt_end)}\n{text}\n\n")
     print(f"  Saved SRT: {output_path}")
 
 
