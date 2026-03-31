@@ -307,14 +307,58 @@ def get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir):
 # Step 5: Two-phase context-aware translation
 # ---------------------------------------------------------------------------
 
-def analyze_context(segments, llm_client):
-    """Phase A: Analyze overall speech context before translating."""
-    full_transcript = "\n".join(
+MAX_CONTEXT_TOKENS = 3000
+
+
+def _estimate_tokens(text):
+    """Rough token estimate: ~4 chars per token for English."""
+    return len(text) // 4
+
+
+def _chunk_segments_for_context(segments, max_tokens=MAX_CONTEXT_TOKENS):
+    """Split segments into chunks that each fit within the LLM token budget."""
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+    for seg in segments:
+        line = f"[{seg.get('speaker', '?')}] ({seg['start']:.1f}s-{seg['end']:.1f}s) {seg['text']}"
+        tokens = _estimate_tokens(line)
+        if current_tokens + tokens > max_tokens and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_tokens = 0
+        current_chunk.append(seg)
+        current_tokens += tokens
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
+def _merge_contexts(contexts):
+    """Merge multiple context analysis results into one."""
+    merged = dict(contexts[-1])  # base: last chunk for topic/domain/tone
+    merged["key_terms"] = {}
+    merged["keep_original"] = []
+    merged["speakers"] = {}
+    seen_keep = set()
+    for ctx in contexts:
+        merged["key_terms"].update(ctx.get("key_terms", {}))
+        merged["speakers"].update(ctx.get("speakers", {}))
+        for term in ctx.get("keep_original", []):
+            if term not in seen_keep:
+                seen_keep.add(term)
+                merged["keep_original"].append(term)
+    return merged
+
+
+def _analyze_context_single(segments, llm_client):
+    """Analyze a single chunk of segments for context."""
+    transcript = "\n".join(
         f"[{seg.get('speaker', '?')}] ({seg['start']:.1f}s-{seg['end']:.1f}s) {seg['text']}"
         for seg in segments
     )
 
-    prompt = f"""你是一位专业的视频翻译顾问。以下是一段英文演讲/对话的完整字幕。
+    prompt = f"""你是一位专业的视频翻译顾问。以下是一段英文演讲/对话的字幕。
 请分析并返回 JSON：
 
 {{
@@ -322,12 +366,20 @@ def analyze_context(segments, llm_client):
   "domain": "所属领域（科技/商业/教育/医学等）",
   "tone": "整体语气风格（正式/幽默/激情/学术等）",
   "key_terms": {{"english_term": "推荐的中文翻译"}},
+  "keep_original": ["ChatGPT", "iPhone", "...品牌名、产品名、公司名、技术专有名词等应保留英文原文的词汇"],
   "speakers": {{"SPEAKER_00": "角色描述"}},
   "translation_notes": "翻译时需要特别注意的事项"
 }}
 
-完整字幕：
-{full_transcript}
+注意 keep_original 字段：列出所有不应翻译、应保持英文原文的词汇，包括但不限于：
+- 品牌名（ChatGPT, Google, Tesla, TikTok 等）
+- 产品名（iPhone, Model S, GPT-4 等）
+- 公司/组织名（OpenAI, Meta, NASA 等）
+- 广泛使用的技术术语（API, GPU, transformer, fine-tuning 等）
+- 人名的英文形式
+
+字幕内容：
+{transcript}
 
 只返回 JSON，不要解释。"""
 
@@ -340,16 +392,63 @@ def analyze_context(segments, llm_client):
         print(f"  Warning: Failed to parse context analysis JSON, using defaults")
         return {
             "topic": "unknown", "domain": "general", "tone": "neutral",
-            "key_terms": {}, "speakers": {}, "translation_notes": "",
+            "key_terms": {}, "keep_original": [], "speakers": {},
+            "translation_notes": "",
         }
 
 
-def translate_with_context(segments, context, llm_client, batch_size=12):
+def analyze_context(segments, llm_client):
+    """Phase A: Analyze overall speech context before translating.
+
+    For long transcripts, splits into chunks, analyzes each independently,
+    and merges results (union of key_terms/keep_original/speakers).
+    """
+    chunks = _chunk_segments_for_context(segments)
+
+    if len(chunks) == 1:
+        return _analyze_context_single(chunks[0], llm_client)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    print(f"  Splitting {len(segments)} segments into {len(chunks)} chunks for context analysis")
+
+    def _analyze_chunk(args):
+        i, chunk = args
+        print(f"  Analyzing chunk {i + 1}/{len(chunks)} ({len(chunk)} segments)...")
+        return _analyze_context_single(chunk, llm_client)
+
+    with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as pool:
+        contexts = list(pool.map(_analyze_chunk, enumerate(chunks)))
+
+    merged = _merge_contexts(contexts)
+    print(f"  Merged: {len(merged.get('key_terms', {}))} terms, "
+          f"{len(merged.get('keep_original', []))} keep-original, "
+          f"{len(merged.get('speakers', {}))} speakers")
+    return merged
+
+
+def translate_with_context(segments, context, llm_client, batch_size=12,
+                           skip_translated=False):
     """Phase B: Translate in context-aware batches with sliding window."""
     translated = []
+    keep_original = context.get("keep_original", [])
+    keep_original_str = "、".join(keep_original) if keep_original else "无"
 
     for i in range(0, len(segments), batch_size):
         batch = segments[i : i + batch_size]
+
+        # Single pass: collect already-translated and filter needing translation
+        need_translation = []
+        for j, seg in enumerate(batch):
+            idx = i + j
+            if seg.get("zh_text"):
+                translated.append({"id": idx, "zh_text": seg["zh_text"]})
+                if skip_translated:
+                    continue
+            need_translation.append((idx, seg))
+
+        if not need_translation:
+            continue
 
         prev_lines = ""
         if translated:
@@ -359,8 +458,7 @@ def translate_with_context(segments, context, llm_client, batch_size=12):
             ) + "\n\n"
 
         batch_lines = []
-        for j, seg in enumerate(batch):
-            idx = i + j
+        for idx, seg in need_translation:
             duration = seg["end"] - seg["start"]
             target_chars = max(4, int(duration * CHARS_PER_SECOND))
             batch_lines.append(
@@ -374,6 +472,7 @@ def translate_with_context(segments, context, llm_client, batch_size=12):
 领域：{context.get('domain', 'general')}
 风格：{context.get('tone', 'neutral')}
 术语表：{json.dumps(context.get('key_terms', {}), ensure_ascii=False)}
+保持原文不翻译：{keep_original_str}
 注意事项：{context.get('translation_notes', '')}
 
 {prev_lines}【待翻译段落】
@@ -385,17 +484,17 @@ def translate_with_context(segments, context, llm_client, batch_size=12):
 3. 联系上下文，保持前后连贯和术语一致
 4. 保持原文的语气和情感色彩
 5. 人名/专有名词保持一致
+6. 品牌名、产品名、公司名、技术专有名词保留英文原文，不要翻译（如 ChatGPT 不要译为"聊天GPT"）
 
 返回格式（每行一句，#号对应原句编号）：
-#{i} 翻译结果
-#{i+1} 翻译结果
+#{need_translation[0][0]} 翻译结果
+#{need_translation[-1][0]} 翻译结果
 ..."""
 
         response = llm_client.chat(prompt)
         parsed = _parse_translation_response(response)
 
-        for j, seg in enumerate(batch):
-            idx = i + j
+        for idx, seg in need_translation:
             zh_text = parsed.get(idx)
             if zh_text is None:
                 print(f"  Warning: segment #{idx} translation missing, using original text")
@@ -403,7 +502,8 @@ def translate_with_context(segments, context, llm_client, batch_size=12):
             seg["zh_text"] = zh_text
             translated.append({"id": idx, "zh_text": zh_text})
 
-        print(f"  Translated segments {i}-{i + len(batch) - 1}")
+        translated_ids = [idx for idx, _ in need_translation]
+        print(f"  Translated segments {translated_ids[0]}-{translated_ids[-1]}")
 
     return segments
 
@@ -421,7 +521,7 @@ def _parse_translation_response(response):
     return result
 
 
-def translate_segments(segments, llm_client, batch_size=12):
+def translate_segments(segments, llm_client, batch_size=12, skip_translated=False):
     """Full translation pipeline: analyze context, then batch translate."""
     print("  Phase A: Analyzing speech context...")
     context = analyze_context(segments, llm_client)
@@ -432,8 +532,378 @@ def translate_segments(segments, llm_client, batch_size=12):
         print(f"  Key terms: {json.dumps(context['key_terms'], ensure_ascii=False)}")
 
     print("  Phase B: Translating with context...")
-    segments = translate_with_context(segments, context, llm_client, batch_size)
+    segments = translate_with_context(segments, context, llm_client, batch_size,
+                                      skip_translated=skip_translated)
     return segments, context
+
+
+# ---------------------------------------------------------------------------
+# Step 4.5: External subtitle loading (skip LLM when subs exist)
+# ---------------------------------------------------------------------------
+
+# Non-dialogue patterns to strip from external subtitles
+_CREDIT_RE = re.compile(
+    r"^(翻译|译者|审核|校对|校订|字幕|时间轴|压制|后期|特效)"
+    r"[：:]\s*\S+",
+    re.MULTILINE,
+)
+_CREDIT_EN_RE = re.compile(
+    r"^(Translated|Reviewed|Subtitl|Timing|Encoded)\s+by\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SOUND_BRACKET_RE = re.compile(r"[\[【（\(]([^)\]】）]*)[\]】）\)]")
+_MUSIC_RE = re.compile(r"[♪♫🎵🎶].*?[♪♫🎵🎶]|^[♪♫🎵🎶]+$", re.MULTILINE)
+_SOUND_KEYWORDS = frozenset(
+    "笑声 掌声 音乐 欢呼 鼓掌 叹气 哭泣 尖叫 咳嗽 叹息 嘘声 欢笑 喝彩 "
+    "响起 播放 停顿 沉默 哄笑 嘻笑 抽泣 啜泣 喘息 呻吟".split()
+)
+_SOUND_KEYWORDS_EN = frozenset(
+    "applause laughter laughing music cheering clapping sighing crying "
+    "screaming coughing silence pause chuckling sobbing gasping".split()
+)
+
+# Common Traditional Chinese characters that differ from Simplified
+_TRAD_CHARS = frozenset(
+    "國學點這說對開時過還從們來會個經機關東與給當應進種頭體動問裡間發實無義區單導質線環節條"
+    "讓設圖產書總門辦連課認記調選華戰網雲視電話費師題險難際試將場構園價觀記論結紀確萬帶態"
+    "邊響歲夢優齊壓執歡滅濟燈營鑰議護邏較載輸輪軍達運過選鄰鏡開閃閱關際隊隨險電預領養駕"
+)
+
+
+def _parse_srt_timestamp(s):
+    """Parse SRT timestamp 'HH:MM:SS,mmm' to float seconds."""
+    h, m, rest = s.strip().split(":")
+    sec, ms = rest.split(",")
+    return int(h) * 3600 + int(m) * 60 + int(sec) + int(ms) / 1000
+
+
+def _read_subtitle_file(filepath, mode="read"):
+    """Read a subtitle file, trying multiple encodings."""
+    for encoding in ("utf-8-sig", "gb18030", "big5"):
+        try:
+            with open(filepath, "r", encoding=encoding) as f:
+                return f.readlines() if mode == "readlines" else f.read()
+        except (UnicodeDecodeError, LookupError):
+            continue
+    raise ValueError(f"Cannot decode subtitle file: {filepath}")
+
+
+def parse_srt(filepath):
+    """Parse an SRT file into a list of cues: [{start, end, text}, ...]."""
+    content = _read_subtitle_file(filepath)
+
+    cues = []
+    blocks = re.split(r"\n\s*\n", content.strip())
+    for block in blocks:
+        lines = block.strip().split("\n")
+        if len(lines) < 2:
+            continue
+        # Find the timestamp line (may not be the first line)
+        ts_match = None
+        ts_idx = 0
+        for li, line in enumerate(lines):
+            ts_match = re.match(
+                r"(\d{1,2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{3})",
+                line.strip(),
+            )
+            if ts_match:
+                ts_idx = li
+                break
+        if not ts_match:
+            continue
+        start = _parse_srt_timestamp(ts_match.group(1).replace(".", ","))
+        end = _parse_srt_timestamp(ts_match.group(2).replace(".", ","))
+        text = " ".join(l.strip() for l in lines[ts_idx + 1:] if l.strip())
+        if text:
+            cues.append({"start": start, "end": end, "text": text})
+    return cues
+
+
+def _parse_ass_timestamp(ts):
+    """Parse ASS timestamp 'H:MM:SS.cc' to float seconds."""
+    h, m, rest = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(rest)
+
+
+def parse_ass(filepath):
+    """Parse an ASS/SSA file into the same cue format as parse_srt."""
+    lines = _read_subtitle_file(filepath, mode="readlines")
+
+    in_events = False
+    fmt_cols = None
+    cues = []
+    for line in lines:
+        line = line.strip()
+        if line.lower() == "[events]":
+            in_events = True
+            continue
+        if line.startswith("[") and in_events:
+            break
+        if not in_events:
+            continue
+        if line.lower().startswith("format:"):
+            fmt_cols = [c.strip().lower() for c in line.split(":", 1)[1].split(",")]
+            continue
+        if not line.startswith("Dialogue:") or fmt_cols is None:
+            continue
+
+        parts = line.split(":", 1)[1].split(",", len(fmt_cols) - 1)
+        if len(parts) < len(fmt_cols):
+            continue
+        row = dict(zip(fmt_cols, [p.strip() for p in parts]))
+
+        start = _parse_ass_timestamp(row.get("start", "0:00:00.00"))
+        end = _parse_ass_timestamp(row.get("end", "0:00:00.00"))
+        text = row.get("text", "")
+        text = re.sub(r"\{[^}]*\}", "", text)
+        text = text.replace("\\N", " ").replace("\\n", " ").strip()
+        if text:
+            cues.append({"start": start, "end": end, "text": text})
+    return cues
+
+
+def _is_sound_description(match):
+    """Check if a bracketed expression is a sound/stage direction."""
+    content = match.group(1).strip().lower()
+    if any(kw in content for kw in _SOUND_KEYWORDS):
+        return True
+    if any(kw in content for kw in _SOUND_KEYWORDS_EN):
+        return True
+    raw = match.group(1).strip()
+    if re.match(r"^[A-Z\s]+$", raw) and len(raw) > 1:
+        return True
+    return False
+
+
+def clean_subtitle_cues(cues):
+    """Remove non-dialogue entries (credits, sound descriptions, music) from cues."""
+    cleaned = []
+    for cue in cues:
+        text = cue["text"]
+
+        if _CREDIT_RE.search(text) or _CREDIT_EN_RE.search(text):
+            continue
+
+        text = _SOUND_BRACKET_RE.sub(
+            lambda m: "" if _is_sound_description(m) else m.group(0), text
+        )
+
+        # Remove music markers
+        text = _MUSIC_RE.sub("", text)
+
+        text = text.strip()
+        if not text:
+            continue
+
+        cue = dict(cue)
+        cue["text"] = text
+        cleaned.append(cue)
+
+    removed = len(cues) - len(cleaned)
+    if removed:
+        print(f"  Cleaned subtitles: removed {removed} non-dialogue entries")
+    return cleaned
+
+
+def detect_subtitle_language(text):
+    """Detect whether text is Simplified Chinese, Traditional Chinese, or English."""
+    # Count CJK characters
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return "en"
+    cjk = [c for c in chars if "\u4e00" <= c <= "\u9fff"]
+    if len(cjk) < len(chars) * 0.1:
+        return "en"
+    # Check for Traditional Chinese characters
+    trad_count = sum(1 for c in cjk if c in _TRAD_CHARS)
+    if trad_count > len(cjk) * 0.05 or trad_count > 10:
+        return "zht"
+    return "zh"
+
+
+def convert_traditional_to_simplified(cues):
+    """Convert Traditional Chinese cues to Simplified Chinese (mainland conventions)."""
+    from opencc import OpenCC
+    cc = OpenCC("t2s")
+    for cue in cues:
+        cue["text"] = cc.convert(cue["text"])
+    return cues
+
+
+def discover_subtitle(video_path):
+    """Find the best matching subtitle file for a video.
+
+    Globs for {stem}*.srt and {stem}*.ass, extracts language code from filename
+    (e.g. '.TED.zh-CN.srt' → 'zh'), and returns the best match by priority.
+
+    Returns (path, language_hint) where language_hint is 'zh', 'zht', 'en', or 'unknown'.
+    Returns (None, None) if no subtitle found.
+    """
+    video = Path(video_path)
+    stem = video.stem
+    parent = video.parent
+
+    # Language code → internal hint
+    _lang_map = {
+        "zh-cn": "zh", "zh-hans": "zh", "chs": "zh", "zh": "zh",
+        "zh-tw": "zht", "zh-hant": "zht", "cht": "zht", "zht": "zht",
+        "en": "en", "eng": "en",
+    }
+    _priority = {"zh": 0, "zht": 1, "unknown": 2, "en": 3}
+
+    # Glob for subtitle files that start with the video stem
+    sub_files = []
+    for pattern in (f"{stem}*.srt", f"{stem}*.ass"):
+        sub_files.extend(parent.glob(pattern))
+
+    candidates = []
+    for path in sub_files:
+        # Skip the video file itself
+        if path.suffix in (".mp4", ".mkv", ".mov", ".avi"):
+            continue
+        # Extract language tag from the part after the video stem
+        suffix_part = path.stem[len(stem):]  # e.g. ".TED.zh-CN" or ".zh" or ""
+        parts = [p.lower() for p in suffix_part.split(".") if p]
+
+        lang_hint = "unknown"
+        for part in reversed(parts):  # check right-to-left: "zh-cn" before "ted"
+            if part in _lang_map:
+                lang_hint = _lang_map[part]
+                break
+
+        candidates.append((path, lang_hint, _priority.get(lang_hint, 2)))
+
+    if not candidates:
+        return None, None
+
+    # Best priority first, then shorter filename (more specific match)
+    candidates.sort(key=lambda x: (x[2], len(x[0].name)))
+    best_path, lang_hint, _ = candidates[0]
+
+    # For unknown language, detect from content
+    if lang_hint == "unknown":
+        parser = parse_ass if best_path.suffix == ".ass" else parse_srt
+        cues = parser(str(best_path))
+        if not cues:
+            return None, None
+        sample_text = " ".join(c["text"] for c in cues[:50])
+        lang_hint = detect_subtitle_language(sample_text)
+
+    print(f"  Found subtitle: {best_path.name} (detected: {lang_hint})")
+    return str(best_path), lang_hint
+
+
+def match_srt_to_segments(cues, segments):
+    """Match external subtitle cues to ASR segments by timing overlap.
+
+    Uses a two-pointer sweep over sorted cues for O(n+m) performance.
+    Sets seg['zh_text'] for matched segments.
+    Returns (segments, matched_count).
+    """
+    if not cues:
+        return segments, 0
+
+    sorted_cues = sorted(cues, key=lambda c: c["start"])
+    sorted_segs = sorted(enumerate(segments), key=lambda x: x[1]["start"])
+
+    matched = 0
+    cue_ptr = 0
+
+    for seg_idx, seg in sorted_segs:
+        seg_start, seg_end = seg["start"], seg["end"]
+        seg_dur = seg_end - seg_start
+        if seg_dur <= 0:
+            continue
+
+        # Advance cue_ptr past cues that end before this segment starts
+        while cue_ptr > 0 and sorted_cues[cue_ptr - 1]["end"] > seg_start:
+            cue_ptr -= 1  # back up if needed for overlapping cues
+        while cue_ptr < len(sorted_cues) and sorted_cues[cue_ptr]["end"] <= seg_start:
+            cue_ptr += 1
+
+        best_overlap = 0
+        best_cue = None
+        collected = []  # (cue_start, overlap, text)
+
+        # Scan forward from cue_ptr
+        for j in range(cue_ptr, len(sorted_cues)):
+            cue = sorted_cues[j]
+            if cue["start"] >= seg_end:
+                break
+            overlap = min(seg_end, cue["end"]) - max(seg_start, cue["start"])
+            if overlap <= 0:
+                continue
+            ratio = overlap / seg_dur
+            if ratio > 0.3:
+                collected.append((cue["start"], cue["text"]))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_cue = cue
+
+        if collected:
+            if len(collected) > 1:
+                collected.sort(key=lambda x: x[0])  # sort by time
+                seen = set()
+                texts = []
+                for _, t in collected:
+                    if t not in seen:
+                        seen.add(t)
+                        texts.append(t)
+                seg["zh_text"] = "".join(texts)
+            else:
+                seg["zh_text"] = collected[0][1]
+            matched += 1
+        elif best_cue and best_overlap / seg_dur > 0.15:
+            seg["zh_text"] = best_cue["text"]
+            matched += 1
+
+    return segments, matched
+
+
+def load_external_subtitles(video_path, segments):
+    """Load and match external subtitles to ASR segments.
+
+    Returns (segments, subtitle_source) where subtitle_source is a description
+    string like 'zh:video.zh.srt' or None if no usable subs found.
+    """
+    sub_path, lang_hint = discover_subtitle(video_path)
+    if sub_path is None:
+        return segments, None
+
+    # English subs don't help — fall through to LLM
+    if lang_hint == "en":
+        print(f"  Found English-only subtitle, will use LLM translation instead")
+        return segments, None
+
+    # Parse
+    parser = parse_ass if sub_path.endswith(".ass") else parse_srt
+    cues = parser(sub_path)
+    if not cues:
+        print(f"  Warning: subtitle file is empty: {sub_path}")
+        return segments, None
+
+    # Clean non-dialogue entries
+    cues = clean_subtitle_cues(cues)
+    if not cues:
+        print(f"  Warning: all subtitle cues were non-dialogue, skipping")
+        return segments, None
+
+    # Convert Traditional → Simplified if needed
+    source_desc = lang_hint
+    if lang_hint == "zht":
+        print(f"  Converting Traditional Chinese → Simplified Chinese...")
+        cues = convert_traditional_to_simplified(cues)
+        source_desc = "zht→zh"
+
+    # Match to ASR segments
+    segments, matched = match_srt_to_segments(cues, segments)
+    total = len([s for s in segments if s.get("text", "").strip()])
+    print(f"  Matched {matched}/{total} segments from external subtitles")
+
+    if matched == 0:
+        return segments, None
+
+    return segments, f"{source_desc}:{Path(sub_path).name}"
 
 
 # ---------------------------------------------------------------------------
@@ -890,6 +1360,8 @@ def dub_video(
     use_fp16=True,
     tts=None,
     cleanup=False,
+    external_subs=None,
+    no_external_subs=False,
 ):
     """
     Main pipeline: dub an English video into Chinese.
@@ -908,6 +1380,8 @@ def dub_video(
         use_fp16: Use FP16 for IndexTTS2 inference.
         tts: Pre-initialized IndexTTS2 instance (for batch mode).
         cleanup: Delete intermediate files after successful completion.
+        external_subs: Explicit path to external subtitle file (.srt/.ass).
+        no_external_subs: Disable auto-discovery of external subtitles.
     """
     video_path = str(video_path)
     if output_path is None:
@@ -981,11 +1455,27 @@ def dub_video(
         speaker_refs = paths.get("speaker_refs", {})
         print(f"\n[Step 4/11] Skipped (cached)")
 
-    # --- Step 5: Translation ---
+    # --- Step 5: Translation (with external subtitle support) ---
     if done < 6:
         print("\n[Step 5/11] Translating to Chinese...")
-        llm_client = LLMClient(api_key=llm_api_key, api_base=llm_api_base, model=llm_model)
-        segments, context = translate_segments(segments, llm_client)
+
+        # Try external subtitles first
+        if no_external_subs:
+            sub_source = None
+        else:
+            ext_sub = external_subs or video_path
+            segments, sub_source = load_external_subtitles(ext_sub, segments)
+
+        untranslated = sum(1 for s in segments if not s.get("zh_text") and s.get("text", "").strip())
+
+        if sub_source and untranslated == 0:
+            print(f"  All segments matched from external subtitles ({sub_source})")
+        else:
+            if sub_source:
+                print(f"  {len(segments) - untranslated} from external subs, {untranslated} need LLM")
+            llm_client = LLMClient(api_key=llm_api_key, api_base=llm_api_base, model=llm_model)
+            segments, _ = translate_segments(segments, llm_client,
+                                             skip_translated=bool(sub_source))
         translations_path = os.path.join(video_work_dir, "translations.json")
         with open(translations_path, "w", encoding="utf-8") as f:
             json.dump(
@@ -1150,6 +1640,8 @@ def main():
     parser.add_argument("--llm-api-base", default="https://api.openai.com/v1", help="LLM API base URL")
     parser.add_argument("--llm-model", default="gpt-4o-mini", help="LLM model name")
     parser.add_argument("--cleanup", action="store_true", help="Delete intermediate files after completion")
+    parser.add_argument("--external-subs", default=None, help="Path to external subtitle file (.srt or .ass)")
+    parser.add_argument("--no-external-subs", action="store_true", help="Disable auto-discovery of external subtitles")
 
     args = parser.parse_args()
 
@@ -1174,6 +1666,8 @@ def main():
         num_speakers=args.num_speakers,
         use_fp16=use_fp16,
         cleanup=args.cleanup,
+        external_subs=args.external_subs,
+        no_external_subs=args.no_external_subs,
     )
 
     if args.batch:

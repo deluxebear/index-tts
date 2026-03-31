@@ -43,6 +43,7 @@ dependencies = [
   "munch==4.0.0",
   "numba==0.60.0",
   "numpy==1.26.2",
+  "opencc-python-reimplemented>=0.1.7",
   "omegaconf>=2.3.0",
   "opencv-python==4.9.0.80",
   "pandas==2.3.2",
