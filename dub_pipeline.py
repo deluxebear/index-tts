@@ -551,11 +551,17 @@ _CREDIT_EN_RE = re.compile(
     r"^(Translated|Reviewed|Subtitl|Timing|Encoded)\s+by\b",
     re.IGNORECASE | re.MULTILINE,
 )
+# Speaker label: "比拉瓦尔·西杜（BS）:" or "ES：" at start of cue.
+# Full-name form always matches; bare abbreviation form collected dynamically.
+_SPEAKER_FULL_RE = re.compile(
+    r"^(?:[\w\s·\-]+)[（(]([A-Za-z]{1,5})[)）][：:]\s*"
+)
+_SPEAKER_BARE_RE_TMPL = r"^(?:{})[：:]\s*"
 _SOUND_BRACKET_RE = re.compile(r"[\[【（\(]([^)\]】）]*)[\]】）\)]")
 _MUSIC_RE = re.compile(r"[♪♫🎵🎶].*?[♪♫🎵🎶]|^[♪♫🎵🎶]+$", re.MULTILINE)
 _SOUND_KEYWORDS = frozenset(
-    "笑声 掌声 音乐 欢呼 鼓掌 叹气 哭泣 尖叫 咳嗽 叹息 嘘声 欢笑 喝彩 "
-    "响起 播放 停顿 沉默 哄笑 嘻笑 抽泣 啜泣 喘息 呻吟".split()
+    "笑 笑声 掌声 音乐 欢呼 鼓掌 叹气 哭泣 尖叫 咳嗽 叹息 嘘声 欢笑 喝彩 "
+    "响起 播放 停顿 沉默 哄笑 嘻笑 抽泣 啜泣 喘息 呻吟 鼓掌声 欢呼声".split()
 )
 _SOUND_KEYWORDS_EN = frozenset(
     "applause laughter laughing music cheering clapping sighing crying "
@@ -677,13 +683,37 @@ def _is_sound_description(match):
 
 def clean_subtitle_cues(cues):
     """Remove non-dialogue entries (credits, sound descriptions, music) from cues."""
+    # Pass 1: collect known speaker abbreviations from full-name labels
+    # e.g. "比拉瓦尔·西杜（BS）:" → "BS"
+    speaker_abbrevs = set()
+    for cue in cues:
+        m = _SPEAKER_FULL_RE.match(cue["text"])
+        if m:
+            speaker_abbrevs.add(m.group(1))
+
+    # Build bare-label regex only for known speaker abbreviations
+    if speaker_abbrevs:
+        bare_pattern = _SPEAKER_BARE_RE_TMPL.format(
+            "|".join(re.escape(a) for a in speaker_abbrevs)
+        )
+        speaker_re = re.compile(
+            _SPEAKER_FULL_RE.pattern + r"|" + bare_pattern
+        )
+    else:
+        speaker_re = _SPEAKER_FULL_RE
+
     cleaned = []
     for cue in cues:
         text = cue["text"]
 
+        # Strip speaker labels (keep dialogue after the label)
+        text = speaker_re.sub("", text)
+
+        # Then check if remaining text is a credit line
         if _CREDIT_RE.search(text) or _CREDIT_EN_RE.search(text):
             continue
 
+        # Remove sound descriptions in brackets
         text = _SOUND_BRACKET_RE.sub(
             lambda m: "" if _is_sound_description(m) else m.group(0), text
         )
