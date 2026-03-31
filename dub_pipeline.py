@@ -74,10 +74,11 @@ def _save_checkpoint(work_dir, step, segments=None, **extra):
 def _load_checkpoint(work_dir):
     """Load checkpoint if exists."""
     path = os.path.join(work_dir, CHECKPOINT_FILE)
-    if not os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
         return None
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
     print(f"  Resuming from checkpoint: step {data['step']}")
     return data
 
@@ -85,8 +86,10 @@ def _load_checkpoint(work_dir):
 def _clear_checkpoint(work_dir):
     """Remove checkpoint after successful completion."""
     path = os.path.join(work_dir, CHECKPOINT_FILE)
-    if os.path.exists(path):
+    try:
         os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +642,6 @@ def _build_video_with_slowdowns(video_only_path, timeline, video_duration, outpu
             concat_inputs.append(f"[{label}]")
             idx += 1
 
-        # The segment itself
         label = f"v{idx}"
         if slowdown > 1.01:
             filter_parts.append(
@@ -748,6 +750,8 @@ def _apply_fade(audio, sr):
 
 def _build_speech_track(segments, sr, total_samples):
     """Place aligned audio segments onto a timeline-aware speech track."""
+    import librosa
+
     speech_track = np.zeros(total_samples, dtype=np.float32)
     for seg in segments:
         aligned_path = seg.get("aligned_path")
@@ -756,7 +760,6 @@ def _build_speech_track(segments, sr, total_samples):
 
         audio, audio_sr = sf.read(aligned_path, dtype="float32")
         if audio_sr != sr:
-            import librosa
             audio = librosa.resample(audio, orig_sr=audio_sr, target_sr=sr)
 
         audio = _apply_fade(audio, sr)
@@ -777,27 +780,37 @@ def _build_speech_track(segments, sr, total_samples):
     return speech_track
 
 
+def _merge_video_audio(video_path, speech_path, bg_path, output_path):
+    """Merge video with speech and background audio tracks."""
+    _run_ffmpeg(
+        "-i", video_path,
+        "-i", speech_path,
+        "-i", bg_path,
+        "-filter_complex",
+        f"[1:a]volume=1.0[speech];[2:a]volume={BG_VOLUME}[bg];"
+        "[speech][bg]amix=inputs=2:duration=longest:normalize=0[aout]",
+        "-map", "0:v:0", "-map", "[aout]",
+        "-c:v", "copy", "-shortest",
+        output_path,
+    )
+
+
 def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_dir,
                    timeline=None, new_total_duration=None):
     """Assemble final video. Two paths:
     - Fast: no video slowdown needed → -c:v copy
     - Slow: video slowdown needed → ffmpeg trim+setpts+concat + bg stretch
     """
-    needs_slowdown = timeline is not None and any(sd > 1.01 for *_, sd in timeline)
-
-    if needs_slowdown:
+    if timeline is not None:
         print("  Using video slowdown path (re-encoding)...")
         video_duration = _get_video_duration(video_only_path)
 
-        # Build slowed video
         slowed_video = os.path.join(work_dir, "video_slowed.mp4")
         _build_video_with_slowdowns(video_only_path, timeline, video_duration, slowed_video)
 
-        # Stretch background audio to match new timeline
         stretched_bg = os.path.join(work_dir, "bg_stretched.wav")
         _stretch_background_audio(bg_audio_path, timeline, new_total_duration, stretched_bg)
 
-        # Build speech track on new timeline
         bg_info = sf.info(stretched_bg)
         sr = bg_info.samplerate
         total_samples = int(new_total_duration * sr)
@@ -806,18 +819,7 @@ def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_d
         sf.write(speech_path, speech_track, sr)
         del speech_track
 
-        # Mix and merge
-        _run_ffmpeg(
-            "-i", slowed_video,
-            "-i", speech_path,
-            "-i", stretched_bg,
-            "-filter_complex",
-            f"[1:a]volume=1.0[speech];[2:a]volume={BG_VOLUME}[bg];"
-            "[speech][bg]amix=inputs=2:duration=longest:normalize=0[aout]",
-            "-map", "0:v:0", "-map", "[aout]",
-            "-c:v", "copy", "-shortest",
-            output_path,
-        )
+        _merge_video_audio(slowed_video, speech_path, stretched_bg, output_path)
     else:
         print("  Using fast path (no video slowdown)...")
         bg_info = sf.info(bg_audio_path)
@@ -828,17 +830,7 @@ def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_d
         sf.write(speech_path, speech_track, sr)
         del speech_track
 
-        _run_ffmpeg(
-            "-i", video_only_path,
-            "-i", speech_path,
-            "-i", bg_audio_path,
-            "-filter_complex",
-            f"[1:a]volume=1.0[speech];[2:a]volume={BG_VOLUME}[bg];"
-            "[speech][bg]amix=inputs=2:duration=longest:normalize=0[aout]",
-            "-map", "0:v:0", "-map", "[aout]",
-            "-c:v", "copy", "-shortest",
-            output_path,
-        )
+        _merge_video_audio(video_only_path, speech_path, bg_audio_path, output_path)
 
     print(f"  Final video: {output_path}")
     return output_path
