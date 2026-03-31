@@ -544,7 +544,7 @@ def translate_segments(segments, llm_client, batch_size=12, skip_translated=Fals
 # Non-dialogue patterns to strip from external subtitles
 _CREDIT_RE = re.compile(
     r"^(翻译|译者|审核|校对|校订|字幕|时间轴|压制|后期|特效)"
-    r"[：:]\s*\S+",
+    r"(人员|者)?[：:]\s*\S+",
     re.MULTILINE,
 )
 _CREDIT_EN_RE = re.compile(
