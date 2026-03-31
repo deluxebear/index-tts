@@ -537,13 +537,16 @@ def align_durations(segments, work_dir):
             stretched = pyrb.time_stretch(audio, sr, rate=audio_rate)
             sf.write(aligned_path, stretched, sr)
         else:
+            # Too short: keep original speed, pad with silence at the end.
+            # Do NOT slow down — slowed speech sounds unnatural.
             seg["video_slowdown"] = 1.0
-            stretched = pyrb.time_stretch(audio, sr, rate=max(ratio, 0.5))
             target_samples = int(target_dur * sr)
-            if len(stretched) < target_samples:
-                padded = np.zeros(target_samples, dtype=stretched.dtype)
-                padded[: len(stretched)] = stretched
+            if len(audio) < target_samples:
+                padded = np.zeros(target_samples, dtype=audio.dtype)
+                padded[: len(audio)] = audio
                 stretched = padded
+            else:
+                stretched = audio
             sf.write(aligned_path, stretched, sr)
 
         seg["aligned_path"] = aligned_path
