@@ -39,7 +39,8 @@ import soundfile as sf
 CHARS_PER_SECOND = 4.5
 STRETCH_MIN = 0.85
 STRETCH_MAX = 1.15
-STRETCH_HARD_LIMIT = 1.5
+AUDIO_COMFORT_LIMIT = 1.2
+VIDEO_SLOWDOWN_MAX = 2.0
 MIN_REF_DURATION = 3.0
 GAP_ABSORB_MAX = 2.0
 BG_VOLUME = 0.3
@@ -490,10 +491,11 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
 # ---------------------------------------------------------------------------
 
 def align_durations(segments, work_dir):
-    """Align generated audio to target duration using time-stretching.
+    """Align generated audio with 50/50 burden split between audio and video.
 
-    Uses 'end_padded' (from absorb_gaps) for more available time.
-    No hard truncation — prefers aggressive stretching over cutting audio.
+    - ratio <= AUDIO_COMFORT_LIMIT (1.2): audio-only speedup
+    - ratio > AUDIO_COMFORT_LIMIT: audio caps at 1.2x, video slows down the rest
+    - Stores seg["video_slowdown"] for later video processing
     """
     import pyrubberband as pyrb
 
@@ -503,31 +505,41 @@ def align_durations(segments, work_dir):
     for i, seg in enumerate(segments):
         if seg.get("wav_path") is None:
             seg["aligned_path"] = None
+            seg["video_slowdown"] = 1.0
             continue
 
-        # Use padded end (with absorbed gap) for more room
         target_dur = seg.get("end_padded", seg["end"]) - seg["start"]
         actual_dur = seg["actual_duration"]
 
         if target_dur <= 0 or actual_dur <= 0:
             seg["aligned_path"] = seg["wav_path"]
+            seg["video_slowdown"] = 1.0
             continue
 
         ratio = actual_dur / target_dur
-        aligned_path = os.path.join(aligned_dir, f"aligned_{i:04d}.wav")
 
         if 0.99 <= ratio <= 1.01:
             seg["aligned_path"] = seg["wav_path"]
             seg["aligned_duration"] = actual_dur
+            seg["video_slowdown"] = 1.0
             continue
 
+        aligned_path = os.path.join(aligned_dir, f"aligned_{i:04d}.wav")
         audio, sr = sf.read(seg["wav_path"])
 
         if ratio > 1.0:
-            stretch_rate = min(ratio, STRETCH_HARD_LIMIT)
-            stretched = pyrb.time_stretch(audio, sr, rate=stretch_rate)
+            if ratio <= AUDIO_COMFORT_LIMIT:
+                audio_rate = ratio
+                seg["video_slowdown"] = 1.0
+            else:
+                # 50/50 split: audio caps at comfort limit, video absorbs the rest
+                video_slowdown = min(ratio / AUDIO_COMFORT_LIMIT, VIDEO_SLOWDOWN_MAX)
+                audio_rate = ratio / video_slowdown
+                seg["video_slowdown"] = video_slowdown
+            stretched = pyrb.time_stretch(audio, sr, rate=audio_rate)
             sf.write(aligned_path, stretched, sr)
         else:
+            seg["video_slowdown"] = 1.0
             stretched = pyrb.time_stretch(audio, sr, rate=max(ratio, 0.5))
             target_samples = int(target_dur * sr)
             if len(stretched) < target_samples:
@@ -539,7 +551,184 @@ def align_durations(segments, work_dir):
         seg["aligned_path"] = aligned_path
         seg["aligned_duration"] = len(stretched) / sr
 
+        if seg["video_slowdown"] > 1.01:
+            print(f"  [{i:3d}] video_slowdown={seg['video_slowdown']:.2f}x, audio_rate={ratio/seg['video_slowdown']:.2f}x")
+
+    slowdown_count = sum(1 for s in segments if s.get("video_slowdown", 1.0) > 1.01)
+    if slowdown_count:
+        print(f"  {slowdown_count} segments need video slowdown")
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Step 7.5: Timeline computation for video slowdown
+# ---------------------------------------------------------------------------
+
+def _get_video_duration(video_path):
+    """Get video duration in seconds using ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout.strip())
+
+
+def compute_shifted_timeline(segments, video_duration):
+    """Build timeline mapping from original to new timestamps after video slowdowns.
+
+    Returns (timeline, new_total_duration).
+    timeline: list of (orig_start, orig_end, new_start, new_end, slowdown)
+    Also sets seg["new_start"] on each segment.
+    """
+    sorted_segs = sorted(
+        [s for s in segments if s.get("aligned_path") is not None],
+        key=lambda s: s["start"],
+    )
+
+    timeline = []
+    cumulative_shift = 0.0
+    prev_orig_end = 0.0
+
+    for seg in sorted_segs:
+        orig_start = seg["start"]
+        orig_end = seg.get("end_padded", seg["end"])
+        slowdown = seg.get("video_slowdown", 1.0)
+
+        # Gap before this segment inherits the cumulative shift
+        new_start = orig_start + cumulative_shift
+        orig_dur = orig_end - orig_start
+        new_dur = orig_dur * slowdown
+        added_time = new_dur - orig_dur
+        new_end = new_start + new_dur
+        cumulative_shift += added_time
+
+        timeline.append((orig_start, orig_end, new_start, new_end, slowdown))
+        seg["new_start"] = new_start
+        prev_orig_end = orig_end
+
+    # Set new_start for segments without aligned audio (empty text, etc.)
+    for seg in segments:
+        if "new_start" not in seg:
+            shift = sum(
+                (oe - os) * (sd - 1.0)
+                for (os, oe, _, _, sd) in timeline
+                if os < seg["start"]
+            )
+            seg["new_start"] = seg["start"] + shift
+
+    new_total = video_duration + cumulative_shift
+    return timeline, new_total
+
+
+def _build_video_with_slowdowns(video_only_path, timeline, video_duration, output_path):
+    """Rebuild video with per-segment slowdowns using ffmpeg filter_complex."""
+    filter_parts = []
+    concat_inputs = []
+    idx = 0
+    prev_end = 0.0
+
+    for (orig_start, orig_end, _, _, slowdown) in timeline:
+        # Passthrough gap before this segment
+        if orig_start > prev_end + 0.01:
+            label = f"v{idx}"
+            filter_parts.append(
+                f"[0:v]trim={prev_end:.3f}:{orig_start:.3f},setpts=PTS-STARTPTS[{label}]"
+            )
+            concat_inputs.append(f"[{label}]")
+            idx += 1
+
+        # The segment itself
+        label = f"v{idx}"
+        if slowdown > 1.01:
+            filter_parts.append(
+                f"[0:v]trim={orig_start:.3f}:{orig_end:.3f},setpts={slowdown:.4f}*(PTS-STARTPTS)[{label}]"
+            )
+        else:
+            filter_parts.append(
+                f"[0:v]trim={orig_start:.3f}:{orig_end:.3f},setpts=PTS-STARTPTS[{label}]"
+            )
+        concat_inputs.append(f"[{label}]")
+        idx += 1
+        prev_end = orig_end
+
+    # Tail after last segment
+    if prev_end < video_duration - 0.01:
+        label = f"v{idx}"
+        filter_parts.append(
+            f"[0:v]trim={prev_end:.3f},setpts=PTS-STARTPTS[{label}]"
+        )
+        concat_inputs.append(f"[{label}]")
+        idx += 1
+
+    concat_str = "".join(concat_inputs)
+    filter_parts.append(f"{concat_str}concat=n={idx}:v=1:a=0[vout]")
+    filter_complex = ";".join(filter_parts)
+
+    _run_ffmpeg(
+        "-i", video_only_path,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-an",
+        output_path,
+    )
+    print(f"  Built slowdown video: {output_path}")
+
+
+def _stretch_background_audio(bg_audio_path, timeline, new_total_duration, output_path):
+    """Stretch background audio to match the shifted video timeline."""
+    import pyrubberband as pyrb
+
+    bg_audio, sr = sf.read(bg_audio_path, dtype="float32")
+    if bg_audio.ndim == 2:
+        bg_audio = np.mean(bg_audio, axis=1)
+    new_total_samples = int(new_total_duration * sr)
+    new_bg = np.zeros(new_total_samples, dtype=np.float32)
+
+    prev_orig_end = 0.0
+    prev_new_end = 0.0
+
+    for (orig_start, orig_end, new_start, new_end, slowdown) in timeline:
+        # Copy passthrough region before this segment
+        if orig_start > prev_orig_end + 0.001:
+            src_s = int(prev_orig_end * sr)
+            src_e = int(orig_start * sr)
+            dst_s = int(prev_new_end * sr)
+            chunk = bg_audio[src_s:src_e]
+            end_idx = min(len(chunk), new_total_samples - dst_s)
+            if end_idx > 0:
+                new_bg[dst_s:dst_s + end_idx] = chunk[:end_idx]
+
+        # Stretch slowed region
+        src_s = int(orig_start * sr)
+        src_e = int(orig_end * sr)
+        dst_s = int(new_start * sr)
+        chunk = bg_audio[src_s:src_e]
+        if len(chunk) > 0 and slowdown > 1.01:
+            stretched = pyrb.time_stretch(chunk, sr, rate=1.0 / slowdown)
+            end_idx = min(len(stretched), new_total_samples - dst_s)
+            if end_idx > 0:
+                new_bg[dst_s:dst_s + end_idx] = stretched[:end_idx]
+        elif len(chunk) > 0:
+            end_idx = min(len(chunk), new_total_samples - dst_s)
+            if end_idx > 0:
+                new_bg[dst_s:dst_s + end_idx] = chunk[:end_idx]
+
+        prev_orig_end = orig_end
+        prev_new_end = new_end
+
+    # Copy tail
+    if prev_orig_end < len(bg_audio) / sr:
+        src_s = int(prev_orig_end * sr)
+        dst_s = int(prev_new_end * sr)
+        chunk = bg_audio[src_s:]
+        end_idx = min(len(chunk), new_total_samples - dst_s)
+        if end_idx > 0:
+            new_bg[dst_s:dst_s + end_idx] = chunk[:end_idx]
+
+    sf.write(output_path, new_bg, sr)
+    print(f"  Stretched background audio: {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -556,12 +745,8 @@ def _apply_fade(audio, sr):
     return audio
 
 
-def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_dir):
-    """Assemble Chinese speech + background + video into final output."""
-    bg_info = sf.info(bg_audio_path)
-    sr = bg_info.samplerate
-    total_samples = bg_info.frames
-
+def _build_speech_track(segments, sr, total_samples):
+    """Place aligned audio segments onto a timeline-aware speech track."""
     speech_track = np.zeros(total_samples, dtype=np.float32)
     for seg in segments:
         aligned_path = seg.get("aligned_path")
@@ -573,10 +758,11 @@ def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_d
             import librosa
             audio = librosa.resample(audio, orig_sr=audio_sr, target_sr=sr)
 
-        # Apply fade to avoid click at segment boundaries
         audio = _apply_fade(audio, sr)
 
-        start_sample = int(seg["start"] * sr)
+        # Use new_start (shifted timeline) if available, else original start
+        start_time = seg.get("new_start", seg["start"])
+        start_sample = int(start_time * sr)
         end_sample = start_sample + len(audio)
 
         if start_sample >= total_samples:
@@ -585,25 +771,73 @@ def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_d
             audio = audio[: total_samples - start_sample]
             end_sample = total_samples
 
-        # Additive mix (not overwrite) — handles overlapping segments gracefully
         speech_track[start_sample:end_sample] += audio[: end_sample - start_sample]
 
-    speech_path = os.path.join(work_dir, "chinese_speech.wav")
-    sf.write(speech_path, speech_track, sr)
-    del speech_track
+    return speech_track
 
-    # Mix speech + background (with volume control) and merge with video
-    _run_ffmpeg(
-        "-i", video_only_path,
-        "-i", speech_path,
-        "-i", bg_audio_path,
-        "-filter_complex",
-        f"[1:a]volume=1.0[speech];[2:a]volume={BG_VOLUME}[bg];"
-        "[speech][bg]amix=inputs=2:duration=longest:normalize=0[aout]",
-        "-map", "0:v:0", "-map", "[aout]",
-        "-c:v", "copy", "-shortest",
-        output_path,
-    )
+
+def assemble_final(segments, bg_audio_path, video_only_path, output_path, work_dir,
+                   timeline=None, new_total_duration=None):
+    """Assemble final video. Two paths:
+    - Fast: no video slowdown needed → -c:v copy
+    - Slow: video slowdown needed → ffmpeg trim+setpts+concat + bg stretch
+    """
+    needs_slowdown = timeline is not None and any(sd > 1.01 for *_, sd in timeline)
+
+    if needs_slowdown:
+        print("  Using video slowdown path (re-encoding)...")
+        video_duration = _get_video_duration(video_only_path)
+
+        # Build slowed video
+        slowed_video = os.path.join(work_dir, "video_slowed.mp4")
+        _build_video_with_slowdowns(video_only_path, timeline, video_duration, slowed_video)
+
+        # Stretch background audio to match new timeline
+        stretched_bg = os.path.join(work_dir, "bg_stretched.wav")
+        _stretch_background_audio(bg_audio_path, timeline, new_total_duration, stretched_bg)
+
+        # Build speech track on new timeline
+        bg_info = sf.info(stretched_bg)
+        sr = bg_info.samplerate
+        total_samples = int(new_total_duration * sr)
+        speech_track = _build_speech_track(segments, sr, total_samples)
+        speech_path = os.path.join(work_dir, "chinese_speech.wav")
+        sf.write(speech_path, speech_track, sr)
+        del speech_track
+
+        # Mix and merge
+        _run_ffmpeg(
+            "-i", slowed_video,
+            "-i", speech_path,
+            "-i", stretched_bg,
+            "-filter_complex",
+            f"[1:a]volume=1.0[speech];[2:a]volume={BG_VOLUME}[bg];"
+            "[speech][bg]amix=inputs=2:duration=longest:normalize=0[aout]",
+            "-map", "0:v:0", "-map", "[aout]",
+            "-c:v", "copy", "-shortest",
+            output_path,
+        )
+    else:
+        print("  Using fast path (no video slowdown)...")
+        bg_info = sf.info(bg_audio_path)
+        sr = bg_info.samplerate
+        total_samples = bg_info.frames
+        speech_track = _build_speech_track(segments, sr, total_samples)
+        speech_path = os.path.join(work_dir, "chinese_speech.wav")
+        sf.write(speech_path, speech_track, sr)
+        del speech_track
+
+        _run_ffmpeg(
+            "-i", video_only_path,
+            "-i", speech_path,
+            "-i", bg_audio_path,
+            "-filter_complex",
+            f"[1:a]volume=1.0[speech];[2:a]volume={BG_VOLUME}[bg];"
+            "[speech][bg]amix=inputs=2:duration=longest:normalize=0[aout]",
+            "-map", "0:v:0", "-map", "[aout]",
+            "-c:v", "copy", "-shortest",
+            output_path,
+        )
 
     print(f"  Final video: {output_path}")
     return output_path
@@ -623,7 +857,10 @@ def _format_srt_time(seconds):
 
 
 def generate_srt(segments, output_path, lang="zh"):
-    """Generate SRT subtitle file aligned to actual dubbed audio timing."""
+    """Generate SRT subtitle file aligned to actual dubbed audio timing.
+
+    Uses new_start (shifted timeline) and aligned_duration (post-stretch).
+    """
     text_key = "zh_text" if lang == "zh" else "text"
     with open(output_path, "w", encoding="utf-8") as f:
         idx = 0
@@ -632,13 +869,12 @@ def generate_srt(segments, output_path, lang="zh"):
             if not text.strip():
                 continue
             idx += 1
-            srt_start = seg["start"]
-            # Use aligned duration (post-stretch) so subtitle matches actual speech
+            srt_start = seg.get("new_start", seg["start"])
             aligned_dur = seg.get("aligned_duration")
             if aligned_dur is not None:
                 srt_end = srt_start + aligned_dur
             else:
-                srt_end = seg["end"]
+                srt_end = srt_start + (seg["end"] - seg["start"])
             f.write(f"{idx}\n{_format_srt_time(srt_start)} --> {_format_srt_time(srt_end)}\n{text}\n\n")
     print(f"  Saved SRT: {output_path}")
 
@@ -702,29 +938,29 @@ def dub_video(
 
     # --- Step 1: Extract tracks ---
     if done < 1:
-        print("\n[Step 1/10] Extracting audio and video tracks...")
+        print("\n[Step 1/11] Extracting audio and video tracks...")
         audio_path, video_only_path = extract_tracks(video_path, video_work_dir)
         paths.update(audio_path=audio_path, video_only_path=video_only_path)
         _save_checkpoint(video_work_dir, 1, paths=paths)
     else:
         audio_path = paths["audio_path"]
         video_only_path = paths["video_only_path"]
-        print(f"\n[Step 1/10] Skipped (cached)")
+        print(f"\n[Step 1/11] Skipped (cached)")
 
     # --- Step 2: Source separation ---
     if done < 2:
-        print("\n[Step 2/10] Separating vocals from background...")
+        print("\n[Step 2/11] Separating vocals from background...")
         vocals_path, bg_path = separate_vocals(audio_path, video_work_dir)
         paths.update(vocals_path=vocals_path, bg_path=bg_path)
         _save_checkpoint(video_work_dir, 2, paths=paths)
     else:
         vocals_path = paths["vocals_path"]
         bg_path = paths["bg_path"]
-        print(f"\n[Step 2/10] Skipped (cached)")
+        print(f"\n[Step 2/11] Skipped (cached)")
 
     # --- Step 3: ASR + diarization ---
     if done < 3:
-        print("\n[Step 3/10] Transcribing and diarizing...")
+        print("\n[Step 3/11] Transcribing and diarizing...")
         segments = transcribe_and_diarize(vocals_path, hf_token, num_speakers)
         transcript_path = os.path.join(video_work_dir, "transcript.json")
         with open(transcript_path, "w", encoding="utf-8") as f:
@@ -732,29 +968,29 @@ def dub_video(
         print(f"  Saved transcript: {transcript_path}")
         _save_checkpoint(video_work_dir, 3, segments=segments, paths=paths)
     else:
-        print(f"\n[Step 3/10] Skipped (cached, {len(segments)} segments)")
+        print(f"\n[Step 3/11] Skipped (cached, {len(segments)} segments)")
 
     # --- Step 3.5: Gap absorption ---
     if done < 4:
-        print("\n[Step 3.5/10] Absorbing inter-segment gaps...")
+        print("\n[Step 3.5/11] Absorbing inter-segment gaps...")
         segments = absorb_gaps(segments)
         _save_checkpoint(video_work_dir, 4, segments=segments, paths=paths)
     else:
-        print(f"\n[Step 3.5/10] Skipped (cached)")
+        print(f"\n[Step 3.5/11] Skipped (cached)")
 
     # --- Step 4: Speaker references ---
     if done < 5:
-        print("\n[Step 4/10] Extracting speaker references...")
+        print("\n[Step 4/11] Extracting speaker references...")
         speaker_refs = extract_speaker_refs(segments, vocals_path, video_work_dir, fallback_refs)
         paths["speaker_refs"] = speaker_refs
         _save_checkpoint(video_work_dir, 5, segments=segments, paths=paths)
     else:
         speaker_refs = paths.get("speaker_refs", {})
-        print(f"\n[Step 4/10] Skipped (cached)")
+        print(f"\n[Step 4/11] Skipped (cached)")
 
     # --- Step 5: Translation ---
     if done < 6:
-        print("\n[Step 5/10] Translating to Chinese...")
+        print("\n[Step 5/11] Translating to Chinese...")
         llm_client = LLMClient(api_key=llm_api_key, api_base=llm_api_base, model=llm_model)
         segments, context = translate_segments(segments, llm_client)
         translations_path = os.path.join(video_work_dir, "translations.json")
@@ -768,36 +1004,58 @@ def dub_video(
         print(f"  Saved translations: {translations_path}")
         _save_checkpoint(video_work_dir, 6, segments=segments, paths=paths)
     else:
-        print(f"\n[Step 5/10] Skipped (cached)")
+        print(f"\n[Step 5/11] Skipped (cached)")
 
     # --- Step 6: TTS generation ---
     if done < 7:
-        print("\n[Step 6/10] Generating Chinese speech with IndexTTS2...")
+        print("\n[Step 6/11] Generating Chinese speech with IndexTTS2...")
         if tts is None:
             tts = _init_tts(model_dir, use_fp16)
         segments = generate_speech(segments, speaker_refs, vocals_path, video_work_dir, tts)
         _save_checkpoint(video_work_dir, 7, segments=segments, paths=paths)
     else:
-        print(f"\n[Step 6/10] Skipped (cached)")
+        print(f"\n[Step 6/11] Skipped (cached)")
 
-    # --- Step 7: Duration alignment ---
+    # --- Step 7: Duration alignment (with 50/50 video slowdown) ---
     if done < 8:
-        print("\n[Step 7/10] Aligning durations...")
+        print("\n[Step 7/11] Aligning durations (audio + video)...")
         segments = align_durations(segments, video_work_dir)
         _save_checkpoint(video_work_dir, 8, segments=segments, paths=paths)
     else:
-        print(f"\n[Step 7/10] Skipped (cached)")
+        print(f"\n[Step 7/11] Skipped (cached)")
+
+    # --- Step 7.5: Compute shifted timeline ---
+    needs_slowdown = any(seg.get("video_slowdown", 1.0) > 1.01 for seg in segments)
+    timeline = None
+    new_total = None
+    if needs_slowdown:
+        if done < 9:
+            print("\n[Step 7.5/11] Computing shifted timeline for video slowdown...")
+            video_duration = _get_video_duration(video_only_path)
+            timeline, new_total = compute_shifted_timeline(segments, video_duration)
+            print(f"  Original duration: {video_duration:.1f}s → New duration: {new_total:.1f}s (+{new_total - video_duration:.1f}s)")
+            _save_checkpoint(video_work_dir, 9, segments=segments, paths=paths,
+                             timeline=timeline, new_total=new_total)
+        else:
+            timeline = ckpt.get("timeline")
+            new_total = ckpt.get("new_total")
+            # Restore new_start from checkpoint segments
+            print(f"\n[Step 7.5/11] Skipped (cached)")
+    else:
+        for seg in segments:
+            seg["new_start"] = seg["start"]
 
     # --- Step 8-9: Assembly ---
-    if done < 9:
-        print("\n[Step 8-9/10] Assembling final video...")
-        assemble_final(segments, bg_path, video_only_path, output_path, video_work_dir)
-        _save_checkpoint(video_work_dir, 9, segments=segments, paths=paths)
+    if done < 10:
+        print("\n[Step 8-9/11] Assembling final video...")
+        assemble_final(segments, bg_path, video_only_path, output_path, video_work_dir,
+                       timeline=timeline, new_total_duration=new_total)
+        _save_checkpoint(video_work_dir, 10, segments=segments, paths=paths)
     else:
-        print(f"\n[Step 8-9/10] Skipped (cached)")
+        print(f"\n[Step 8-9/11] Skipped (cached)")
 
-    # --- Step 10: SRT subtitles ---
-    print("\n[Step 10/10] Generating subtitles...")
+    # --- Step 10-11: SRT subtitles ---
+    print("\n[Step 10-11/11] Generating subtitles...")
     srt_base = output_path.rsplit(".", 1)[0]
     generate_srt(segments, f"{srt_base}.srt", lang="zh")
     generate_srt(segments, f"{srt_base}_en.srt", lang="en")
