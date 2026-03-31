@@ -551,12 +551,15 @@ _CREDIT_EN_RE = re.compile(
     r"^(Translated|Reviewed|Subtitl|Timing|Encoded)\s+by\b",
     re.IGNORECASE | re.MULTILINE,
 )
-# Speaker label: "比拉瓦尔·西杜（BS）:" or "ES：" at start of cue.
+# Speaker label: "比拉瓦尔·西杜（BS）:" or "克里斯·安德森（Chris Anderson）：" at start of cue.
 # Full-name form always matches; bare abbreviation form collected dynamically.
+# Group 1 captures the parenthesized part — may be abbreviation ("BS") or full name ("Chris Anderson").
 _SPEAKER_FULL_RE = re.compile(
-    r"^(?:[\w\s·\-]+)[（(]([A-Za-z]{1,5})[)）][：:]\s*"
+    r"^(?:[\w\s·\-]+)[（(]([A-Za-z][A-Za-z\s.\-']*?)[)）]\s*[：:]\s*"
 )
-_SPEAKER_BARE_RE_TMPL = r"^(?:{})[：:]\s*"
+_SPEAKER_BARE_RE_TMPL = r"^(?:{})\s*[：:]\s*"
+# Generic bare uppercase label: "BS:", "CA：", "SA :" etc. — always stripped.
+_SPEAKER_GENERIC_BARE_RE = re.compile(r"^[A-Z]{1,5}\s*[：:]\s*")
 _SOUND_BRACKET_RE = re.compile(r"[\[【（\(]([^)\]】）]*)[\]】）\)]")
 _MUSIC_RE = re.compile(r"[♪♫🎵🎶].*?[♪♫🎵🎶]|^[♪♫🎵🎶]+$", re.MULTILINE)
 _SOUND_KEYWORDS = frozenset(
@@ -685,11 +688,21 @@ def clean_subtitle_cues(cues):
     """Remove non-dialogue entries (credits, sound descriptions, music) from cues."""
     # Pass 1: collect known speaker abbreviations from full-name labels
     # e.g. "比拉瓦尔·西杜（BS）:" → "BS"
+    # e.g. "克里斯·安德森（Chris Anderson）:" → derive "CA" from initials
     speaker_abbrevs = set()
     for cue in cues:
         m = _SPEAKER_FULL_RE.match(cue["text"])
         if m:
-            speaker_abbrevs.add(m.group(1))
+            name_or_abbrev = m.group(1).strip()
+            if " " in name_or_abbrev:
+                # Full name like "Chris Anderson" → derive initials "CA"
+                initials = "".join(
+                    w[0].upper() for w in name_or_abbrev.split() if w and w[0].isalpha()
+                )
+                if initials:
+                    speaker_abbrevs.add(initials)
+            else:
+                speaker_abbrevs.add(name_or_abbrev)
 
     # Build bare-label regex only for known speaker abbreviations
     if speaker_abbrevs:
@@ -708,6 +721,7 @@ def clean_subtitle_cues(cues):
 
         # Strip speaker labels (keep dialogue after the label)
         text = speaker_re.sub("", text)
+        text = _SPEAKER_GENERIC_BARE_RE.sub("", text)
 
         # Then check if remaining text is a credit line
         if _CREDIT_RE.search(text) or _CREDIT_EN_RE.search(text):
