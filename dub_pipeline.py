@@ -162,8 +162,9 @@ def transcribe_and_diarize(vocals_path, hf_token, num_speakers=None):
     del align_model  # free GPU memory
 
     print("  Running speaker diarization...")
-    diarize_model = whisperx.DiarizationPipeline(
-        use_auth_token=hf_token, device=device
+    from whisperx.diarize import DiarizationPipeline
+    diarize_model = DiarizationPipeline(
+        token=hf_token, device=device
     )
     diarize_kwargs = {}
     if num_speakers is not None:
