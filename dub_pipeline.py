@@ -37,8 +37,6 @@ import numpy as np
 import soundfile as sf
 
 CHARS_PER_SECOND = 4.5
-STRETCH_MIN = 0.85
-STRETCH_MAX = 1.15
 AUDIO_COMFORT_LIMIT = 1.2
 VIDEO_SLOWDOWN_MAX = 2.0
 MIN_REF_DURATION = 3.0
