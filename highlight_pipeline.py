@@ -375,35 +375,39 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
     )
     processor = AutoProcessor.from_pretrained(vl_model_name)
 
-    # Pre-extract frames with ffmpeg to avoid torchvision decoding entire video into RAM
+    # Pre-extract frames as JPEG images to bypass torchvision video decoding entirely
     video_info = _get_video_info(video_path)
     video_dur = video_info["duration"]
     nframes = min(int(video_dur * VL_FPS), VL_MAX_FRAMES)
-    # Compute actual fps for ffmpeg to get exactly nframes
     extract_fps = nframes / video_dur if video_dur > 0 else VL_FPS
-    sampled_video = os.path.join(work_dir, "vl_sampled.mp4")
-    if not os.path.exists(sampled_video):
-        print(f"  Pre-extracting {nframes} frames from {video_dur:.0f}s video (ffmpeg)...")
-        # Use -vsync vfr + output fps to ensure metadata duration matches actual frames
-        out_fps = max(1, nframes // max(1, int(video_dur // nframes)))
+    frames_dir = os.path.join(work_dir, "vl_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    frame_pattern = os.path.join(frames_dir, "frame_%04d.jpg")
+    existing_frames = sorted(
+        f for f in os.listdir(frames_dir) if f.startswith("frame_") and f.endswith(".jpg")
+    ) if os.path.isdir(frames_dir) else []
+    if not existing_frames:
+        print(f"  Extracting {nframes} frames from {video_dur:.0f}s video (ffmpeg)...")
         _run_ffmpeg(
             "-i", video_path,
             "-vf", f"fps={extract_fps:.6f},scale=480:-2",
-            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-r", str(out_fps),
-            "-vsync", "cfr",
-            sampled_video,
+            "-q:v", "5",
+            frame_pattern,
         )
-    else:
-        print(f"  Using cached sampled video ({nframes} frames)")
+        existing_frames = sorted(
+            f for f in os.listdir(frames_dir) if f.startswith("frame_") and f.endswith(".jpg")
+        )
+    print(f"  Using {len(existing_frames)} extracted frames")
 
+    # Pass frames as image list — bypasses torchvision/torchcodec video readers
+    frame_paths = [f"file://{os.path.abspath(os.path.join(frames_dir, f))}" for f in existing_frames]
     messages = [
         {
             "role": "user",
             "content": [
                 {
                     "type": "video",
-                    "video": f"file://{os.path.abspath(sampled_video)}",
+                    "video": frame_paths,
                     "total_pixels": VL_TOTAL_PIXELS,
                     "min_pixels": VL_MIN_PIXELS,
                 },
