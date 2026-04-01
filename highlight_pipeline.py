@@ -58,9 +58,9 @@ TTS_SAMPLE_RATE = 24000
 X264_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
 AAC_ARGS = ["-c:a", "aac", "-b:a", "128k"]
 
-# Qwen2.5-VL defaults
-VL_FPS = 2.0
-VL_TOTAL_PIXELS = 20480 * 28 * 28
+# Qwen2.5-VL defaults (tuned for L4 24GB VRAM)
+VL_FPS = 1.0
+VL_TOTAL_PIXELS = 12288 * 28 * 28
 VL_MIN_PIXELS = 128 * 28 * 28
 
 # ffprobe result cache (avoids repeated subprocess spawns for the same file)
@@ -346,17 +346,29 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
 
     prompt = _build_vl_prompt(transcript_text, video_duration_str)
 
-    # Load model
+    # Load model (4-bit quantized to fit L4 24GB with video frames)
     print(f"  Loading {vl_model_name}...")
     try:
         import flash_attn  # noqa: F401
         attn_impl = "flash_attention_2"
     except ImportError:
         attn_impl = "eager"
+    try:
+        from transformers import BitsAndBytesConfig
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+        )
+        print("  Using 4-bit quantization (saves ~10GB VRAM)")
+    except ImportError:
+        quantization_config = None
+        print("  bitsandbytes not available, loading in bfloat16")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         vl_model_name,
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_impl,
+        quantization_config=quantization_config,
         device_map="auto",
     )
     processor = AutoProcessor.from_pretrained(vl_model_name)
