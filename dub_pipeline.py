@@ -259,8 +259,50 @@ def extract_audio_segment(audio_path, start, end, output_path):
     sf.write(output_path, audio, sr)
 
 
+def _compute_speaker_embedding(audio_path):
+    """Compute a 192-dim speaker embedding using CAMPPlus.
+
+    Loads the model on first call (CPU only, very lightweight).
+    Returns a numpy vector of shape (192,).
+    """
+    import torch
+    import torchaudio
+    from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
+
+    if not hasattr(_compute_speaker_embedding, "_model"):
+        from huggingface_hub import hf_hub_download
+        ckpt = hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
+        model = CAMPPlus(feat_dim=80, embedding_size=192)
+        model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+        model.eval()
+        _compute_speaker_embedding._model = model
+
+    model = _compute_speaker_embedding._model
+    audio, sr = torchaudio.load(audio_path)
+    if audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    if sr != 16000:
+        audio = torchaudio.transforms.Resample(sr, 16000)(audio)
+    feat = torchaudio.compliance.kaldi.fbank(audio, num_mel_bins=80, dither=0,
+                                              sample_frequency=16000)
+    feat = feat - feat.mean(dim=0, keepdim=True)
+    with torch.no_grad():
+        emb = model(feat.unsqueeze(0))  # [1, 192]
+    return emb.squeeze(0).numpy()
+
+
+def _cosine_similarity(a, b):
+    """Cosine similarity between two 1-D numpy vectors."""
+    dot = np.dot(a, b)
+    norm = np.linalg.norm(a) * np.linalg.norm(b)
+    return dot / norm if norm > 0 else 0.0
+
+
+SPEAKER_SIM_THRESHOLD = 0.7  # below this, diarization label is likely wrong
+
+
 def extract_speaker_refs(segments, vocals_path, work_dir, fallback_refs=None):
-    """Extract the best (longest) reference audio per speaker."""
+    """Extract the best (longest) reference audio per speaker with embeddings."""
     speakers = {}
     for seg in segments:
         spk = seg.get("speaker", "UNKNOWN")
@@ -282,15 +324,34 @@ def extract_speaker_refs(segments, vocals_path, work_dir, fallback_refs=None):
         else:
             fallback = ref_path
 
-        speaker_refs[spk] = {"fallback": fallback, "best_auto": ref_path}
+        # Pre-compute speaker embedding for voice consistency verification
+        embedding = _compute_speaker_embedding(ref_path)
+
+        speaker_refs[spk] = {
+            "fallback": fallback,
+            "best_auto": ref_path,
+            "embedding": embedding,
+        }
         dur = best_seg["end"] - best_seg["start"]
         print(f"  {spk}: best ref {dur:.1f}s, fallback={'user-provided' if fallback_refs and spk in fallback_refs else 'auto'}")
 
     return speaker_refs
 
 
+def _find_best_speaker(seg_embedding, speaker_refs):
+    """Find the speaker whose embedding is most similar to the segment."""
+    best_spk = None
+    best_sim = -1.0
+    for spk, info in speaker_refs.items():
+        sim = _cosine_similarity(seg_embedding, info["embedding"])
+        if sim > best_sim:
+            best_sim = sim
+            best_spk = spk
+    return best_spk, best_sim
+
+
 def get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir):
-    """Select reference audio: use segment itself if >= MIN_REF_DURATION, else fallback."""
+    """Select reference audio with speaker embedding verification for short segments."""
     duration = seg["end"] - seg["start"]
     spk = seg.get("speaker", "UNKNOWN")
 
@@ -299,8 +360,27 @@ def get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir):
         if not os.path.exists(seg_ref):
             extract_audio_segment(vocals_path, seg["start"], seg["end"], seg_ref)
         return seg_ref
-    else:
+
+    # Short segment: verify voice matches assigned speaker via embedding
+    seg_ref = os.path.join(seg_ref_dir, f"seg_{seg['start']:.2f}_{seg['end']:.2f}.wav")
+    if not os.path.exists(seg_ref):
+        extract_audio_segment(vocals_path, seg["start"], seg["end"], seg_ref)
+
+    seg_embedding = _compute_speaker_embedding(seg_ref)
+    assigned_sim = _cosine_similarity(seg_embedding, speaker_refs[spk]["embedding"])
+
+    if assigned_sim >= SPEAKER_SIM_THRESHOLD:
         return speaker_refs[spk]["fallback"]
+
+    # Diarization likely wrong — find the best matching speaker
+    best_spk, best_sim = _find_best_speaker(seg_embedding, speaker_refs)
+    if best_spk and best_spk != spk:
+        print(f"  Voice mismatch: seg {seg['start']:.1f}-{seg['end']:.1f}s "
+              f"labeled {spk} (sim={assigned_sim:.2f}) → using {best_spk} (sim={best_sim:.2f})")
+        seg["speaker"] = best_spk  # correct the label for downstream use
+        return speaker_refs[best_spk]["fallback"]
+
+    return speaker_refs[spk]["fallback"]
 
 
 # ---------------------------------------------------------------------------
@@ -427,9 +507,49 @@ def analyze_context(segments, llm_client):
     return merged
 
 
+def _build_translation_prompt(to_translate, context, keep_original_str, prev_lines):
+    """Build the translation prompt for a set of (idx, seg) pairs."""
+    batch_lines = []
+    for idx, seg in to_translate:
+        duration = seg["end"] - seg["start"]
+        target_chars = max(4, int(duration * CHARS_PER_SECOND))
+        batch_lines.append(
+            f"#{idx} [{seg.get('speaker', '?')}] ({duration:.1f}s, ~{target_chars}字) {seg['text']}"
+        )
+
+    return f"""你是一位专业的中文配音翻译。
+
+【背景分析】
+主题：{context.get('topic', 'unknown')}
+领域：{context.get('domain', 'general')}
+风格：{context.get('tone', 'neutral')}
+术语表：{json.dumps(context.get('key_terms', {}), ensure_ascii=False)}
+保持原文不翻译：{keep_original_str}
+注意事项：{context.get('translation_notes', '')}
+
+{prev_lines}【待翻译段落】
+{chr(10).join(batch_lines)}
+
+翻译要求：
+1. 口语化，适合朗读配音，不要书面语
+2. 每句括号中标注了目标时长和建议字数，请严格控制字数
+3. 联系上下文，保持前后连贯和术语一致
+4. 保持原文的语气和情感色彩
+5. 人名/专有名词保持一致
+6. 品牌名、产品名、公司名、技术专有名词保留英文原文，不要翻译（如 ChatGPT 不要译为"聊天GPT"）
+
+返回格式（每行一句，#号对应原句编号）：
+#{to_translate[0][0]} 翻译结果
+#{to_translate[-1][0]} 翻译结果
+..."""
+
+
+MAX_TRANSLATION_RETRIES = 3
+
+
 def translate_with_context(segments, context, llm_client, batch_size=12,
                            skip_translated=False):
-    """Phase B: Translate in context-aware batches with sliding window."""
+    """Phase B: Translate in context-aware batches with sliding window and retry."""
     translated = []
     keep_original = context.get("keep_original", [])
     keep_original_str = "、".join(keep_original) if keep_original else "无"
@@ -457,50 +577,45 @@ def translate_with_context(segments, context, llm_client, batch_size=12,
                 f"#{item['id']}: {item['zh_text']}" for item in prev_items
             ) + "\n\n"
 
-        batch_lines = []
-        for idx, seg in need_translation:
-            duration = seg["end"] - seg["start"]
-            target_chars = max(4, int(duration * CHARS_PER_SECOND))
-            batch_lines.append(
-                f"#{idx} [{seg.get('speaker', '?')}] ({duration:.1f}s, ~{target_chars}字) {seg['text']}"
+        # Retry loop for this batch
+        pending = list(need_translation)
+        for attempt in range(MAX_TRANSLATION_RETRIES):
+            if not pending:
+                break
+
+            prompt = _build_translation_prompt(
+                pending, context, keep_original_str, prev_lines
             )
 
-        prompt = f"""你是一位专业的中文配音翻译。
+            try:
+                response = llm_client.chat(prompt)
+            except Exception as e:
+                print(f"  Warning: LLM API error (attempt {attempt + 1}/{MAX_TRANSLATION_RETRIES}): {e}")
+                continue
 
-【背景分析】
-主题：{context.get('topic', 'unknown')}
-领域：{context.get('domain', 'general')}
-风格：{context.get('tone', 'neutral')}
-术语表：{json.dumps(context.get('key_terms', {}), ensure_ascii=False)}
-保持原文不翻译：{keep_original_str}
-注意事项：{context.get('translation_notes', '')}
+            parsed = _parse_translation_response(response)
 
-{prev_lines}【待翻译段落】
-{chr(10).join(batch_lines)}
+            still_pending = []
+            for idx, seg in pending:
+                zh_text = parsed.get(idx)
+                if zh_text is not None:
+                    seg["zh_text"] = zh_text
+                    translated.append({"id": idx, "zh_text": zh_text})
+                else:
+                    still_pending.append((idx, seg))
 
-翻译要求：
-1. 口语化，适合朗读配音，不要书面语
-2. 每句括号中标注了目标时长和建议字数，请严格控制字数
-3. 联系上下文，保持前后连贯和术语一致
-4. 保持原文的语气和情感色彩
-5. 人名/专有名词保持一致
-6. 品牌名、产品名、公司名、技术专有名词保留英文原文，不要翻译（如 ChatGPT 不要译为"聊天GPT"）
+            pending = still_pending
+            if pending and attempt < MAX_TRANSLATION_RETRIES - 1:
+                missing_ids = [idx for idx, _ in pending]
+                print(f"  Retrying {len(pending)} missing segments {missing_ids} "
+                      f"(attempt {attempt + 2}/{MAX_TRANSLATION_RETRIES})...")
 
-返回格式（每行一句，#号对应原句编号）：
-#{need_translation[0][0]} 翻译结果
-#{need_translation[-1][0]} 翻译结果
-..."""
-
-        response = llm_client.chat(prompt)
-        parsed = _parse_translation_response(response)
-
-        for idx, seg in need_translation:
-            zh_text = parsed.get(idx)
-            if zh_text is None:
-                print(f"  Warning: segment #{idx} translation missing, using original text")
-                zh_text = seg["text"]
-            seg["zh_text"] = zh_text
-            translated.append({"id": idx, "zh_text": zh_text})
+        # Fall back to original text for segments that failed all retries
+        for idx, seg in pending:
+            print(f"  Warning: segment #{idx} translation failed after "
+                  f"{MAX_TRANSLATION_RETRIES} attempts, using original text")
+            seg["zh_text"] = seg["text"]
+            translated.append({"id": idx, "zh_text": seg["text"]})
 
         translated_ids = [idx for idx, _ in need_translation]
         print(f"  Translated segments {translated_ids[0]}-{translated_ids[-1]}")
