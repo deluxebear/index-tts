@@ -607,12 +607,24 @@ def generate_intent_script(analysis, intent_plan, llm_client, target_duration, c
 # ---------------------------------------------------------------------------
 
 def _apply_emotion_profile(emo_vector, emotion_profile):
-    """Blend segment emotion vector with the intent's base emotion profile."""
+    """Blend segment emotion vector with the intent's base emotion profile.
+
+    When allow_high_emotion is False (analytical/educational content),
+    the base vector dominates (80%) and individual dims are capped at 0.4
+    to ensure calm, even narration. When True (emotional/entertaining),
+    the segment vector leads (70%) with a 0.7 cap.
+    """
     base = emotion_profile.get("base_vector", [0] * 8)
     allow_high = emotion_profile.get("allow_high_emotion", False)
-    blended = [emo_vector[i] * 0.7 + base[i] * 0.3 for i in range(8)]
-    if not allow_high:
-        blended = [min(v, 0.7) for v in blended]
+    if allow_high:
+        # Emotional/entertaining: segment leads
+        blended = [emo_vector[i] * 0.7 + base[i] * 0.3 for i in range(8)]
+        cap = 0.7
+    else:
+        # Analytical/educational: base dominates, keep it calm
+        blended = [emo_vector[i] * 0.2 + base[i] * 0.8 for i in range(8)]
+        cap = 0.4
+    blended = [min(v, cap) for v in blended]
     return [max(0.0, min(1.0, v)) for v in blended]
 
 
