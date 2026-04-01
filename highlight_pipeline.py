@@ -374,11 +374,23 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
     )
     processor = AutoProcessor.from_pretrained(vl_model_name)
 
-    # Build message with video input (cap frames to avoid OOM)
+    # Pre-extract frames with ffmpeg to avoid torchvision decoding entire video into RAM
     video_info = _get_video_info(video_path)
     video_dur = video_info["duration"]
     nframes = min(int(video_dur * VL_FPS), VL_MAX_FRAMES)
-    print(f"  Video: {video_dur:.0f}s, sampling {nframes} frames (max {VL_MAX_FRAMES})")
+    # Compute actual fps for ffmpeg to get exactly nframes
+    extract_fps = nframes / video_dur if video_dur > 0 else VL_FPS
+    sampled_video = os.path.join(work_dir, "vl_sampled.mp4")
+    if not os.path.exists(sampled_video):
+        print(f"  Pre-extracting {nframes} frames from {video_dur:.0f}s video (ffmpeg)...")
+        _run_ffmpeg(
+            "-i", video_path,
+            "-vf", f"fps={extract_fps:.6f},scale=480:-2",
+            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            sampled_video,
+        )
+    else:
+        print(f"  Using cached sampled video ({nframes} frames)")
 
     messages = [
         {
@@ -386,10 +398,9 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
             "content": [
                 {
                     "type": "video",
-                    "video": f"file://{os.path.abspath(video_path)}",
+                    "video": f"file://{os.path.abspath(sampled_video)}",
                     "total_pixels": VL_TOTAL_PIXELS,
                     "min_pixels": VL_MIN_PIXELS,
-                    "nframes": nframes,
                 },
                 {"type": "text", "text": prompt},
             ],
