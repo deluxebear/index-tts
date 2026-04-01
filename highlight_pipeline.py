@@ -348,10 +348,15 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
 
     # Load model
     print(f"  Loading {vl_model_name}...")
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "eager"
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         vl_model_name,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
         device_map="auto",
     )
     processor = AutoProcessor.from_pretrained(vl_model_name)
