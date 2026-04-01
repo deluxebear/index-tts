@@ -1612,10 +1612,20 @@ def dub_video(
     if done < 5:
         print("\n[Step 4/11] Extracting speaker references...")
         speaker_refs = extract_speaker_refs(segments, vocals_path, video_work_dir, fallback_refs)
-        paths["speaker_refs"] = speaker_refs
+        # Save checkpoint without numpy embeddings (not JSON serializable)
+        serializable_refs = {
+            spk: {k: v for k, v in info.items() if k != "embedding"}
+            for spk, info in speaker_refs.items()
+        }
+        paths["speaker_refs"] = serializable_refs
         _save_checkpoint(video_work_dir, 5, segments=segments, paths=paths)
+        paths["speaker_refs"] = speaker_refs  # restore full refs with embeddings
     else:
         speaker_refs = paths.get("speaker_refs", {})
+        # Recompute embeddings when resuming from checkpoint
+        for spk, info in speaker_refs.items():
+            if "embedding" not in info and os.path.exists(info.get("best_auto", "")):
+                info["embedding"] = _compute_speaker_embedding(info["best_auto"])
         print(f"\n[Step 4/11] Skipped (cached)")
 
     # --- Step 5: Translation (with external subtitle support) ---
