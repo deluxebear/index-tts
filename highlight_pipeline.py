@@ -59,10 +59,11 @@ X264_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
 AAC_ARGS = ["-c:a", "aac", "-b:a", "128k"]
 
 # Qwen2.5-VL defaults (tuned for L4 24GB VRAM with 4-bit quantization)
-VL_FPS = 0.5
+VL_FPS = 1.0
 VL_TOTAL_PIXELS = 8192 * 28 * 28
 VL_MIN_PIXELS = 128 * 28 * 28
-VL_MAX_FRAMES = 128
+VL_MAX_PIXELS = 360 * 420
+VL_MAX_FRAMES = 256
 
 # ffprobe result cache (avoids repeated subprocess spawns for the same file)
 _video_info_cache = {}
@@ -359,6 +360,7 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
         from transformers import BitsAndBytesConfig
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
         )
@@ -375,28 +377,38 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
     )
     processor = AutoProcessor.from_pretrained(vl_model_name)
 
-    # Pre-extract a short sampled video with ffmpeg to avoid torchvision decoding
-    # the full original video into RAM. The sampled video preserves native video
-    # format so Qwen2.5-VL can use its temporal position encoding and motion understanding.
+    # Extract frames as JPEG images with ffmpeg, then pass as frame list to
+    # Qwen2.5-VL. This bypasses all video decoding libraries (torchvision,
+    # torchcodec, decord) and their associated crashes on Colab.
+    # Temporal encoding is preserved via the fps parameter → mRoPE position IDs.
     video_info = _get_video_info(video_path)
     video_dur = video_info["duration"]
     nframes = min(int(video_dur * VL_FPS), VL_MAX_FRAMES)
     extract_fps = nframes / video_dur if video_dur > 0 else VL_FPS
-    sampled_video = os.path.join(work_dir, "vl_sampled.mp4")
-    if not os.path.exists(sampled_video):
-        print(f"  Pre-extracting {nframes} frames from {video_dur:.0f}s video (ffmpeg)...")
+    frames_dir = os.path.join(work_dir, "vl_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    existing_frames = sorted(
+        f for f in os.listdir(frames_dir) if f.startswith("frame_") and f.endswith(".jpg")
+    )
+    if len(existing_frames) < nframes:
+        print(f"  Extracting {nframes} frames from {video_dur:.0f}s video (ffmpeg)...")
         _run_ffmpeg(
             "-i", video_path,
             "-vf", f"fps={extract_fps:.6f},scale=480:-2",
-            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-pix_fmt", "rgb24",
-            sampled_video,
+            "-q:v", "2",
+            os.path.join(frames_dir, "frame_%04d.jpg"),
         )
-    else:
-        print(f"  Using cached sampled video ({nframes} frames)")
+        existing_frames = sorted(
+            f for f in os.listdir(frames_dir) if f.startswith("frame_") and f.endswith(".jpg")
+        )
+    print(f"  Using {len(existing_frames)} extracted frames")
 
-    # Limit swscaler threads to prevent resource exhaustion on Colab
-    os.environ["SWS_MAX_FILTER_SIZE"] = "1"
+    # Build frame paths and compute fps for temporal alignment
+    frame_paths = [
+        f"file://{os.path.abspath(os.path.join(frames_dir, f))}"
+        for f in existing_frames
+    ]
+    frame_fps = len(existing_frames) / video_dur if video_dur > 0 else VL_FPS
 
     messages = [
         {
@@ -404,9 +416,11 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
             "content": [
                 {
                     "type": "video",
-                    "video": f"file://{os.path.abspath(sampled_video)}",
+                    "video": frame_paths,
+                    "fps": frame_fps,
                     "total_pixels": VL_TOTAL_PIXELS,
                     "min_pixels": VL_MIN_PIXELS,
+                    "max_pixels": VL_MAX_PIXELS,
                 },
                 {"type": "text", "text": prompt},
             ],
@@ -416,11 +430,14 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
     # Process and generate
     print("  Analyzing video (this may take a while for long videos)...")
     text_input = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(messages)
+    image_inputs, video_inputs, video_kwargs = process_vision_info(
+        messages, return_video_kwargs=True
+    )
     inputs = processor(
         text=[text_input],
         images=image_inputs,
         videos=video_inputs,
+        **video_kwargs,
         padding=True,
         return_tensors="pt",
     ).to(model.device)
