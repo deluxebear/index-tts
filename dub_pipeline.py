@@ -43,6 +43,7 @@ MIN_REF_DURATION = 3.0
 GAP_ABSORB_MAX = 2.0
 BG_VOLUME = 0.3
 FADE_MS = 10
+SLOWDOWN_COMFORT_LIMIT = 0.75  # min rate for natural-sounding slowdown
 CHECKPOINT_FILE = "checkpoint.json"
 
 
@@ -1169,16 +1170,19 @@ def align_durations(segments, work_dir):
             stretched = pyrb.time_stretch(audio, sr, rate=audio_rate)
             sf.write(aligned_path, stretched, sr)
         else:
-            # Too short: keep original speed, pad with silence at the end.
-            # Do NOT slow down — slowed speech sounds unnatural.
+            # TTS shorter than target: slow down within comfort limit, then pad remainder
             seg["video_slowdown"] = 1.0
-            target_samples = int(target_dur * sr)
-            if len(audio) < target_samples:
-                padded = np.zeros(target_samples, dtype=audio.dtype)
-                padded[: len(audio)] = audio
-                stretched = padded
+            slowdown_rate = max(ratio, SLOWDOWN_COMFORT_LIMIT)
+            if slowdown_rate < 0.99:
+                stretched = pyrb.time_stretch(audio, sr, rate=slowdown_rate)
             else:
                 stretched = audio
+            # If still shorter after slowdown, pad with silence
+            target_samples = int(target_dur * sr)
+            if len(stretched) < target_samples:
+                padded = np.zeros(target_samples, dtype=stretched.dtype)
+                padded[: len(stretched)] = stretched
+                stretched = padded
             sf.write(aligned_path, stretched, sr)
 
         seg["aligned_path"] = aligned_path
