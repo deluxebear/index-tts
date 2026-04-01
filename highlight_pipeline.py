@@ -961,6 +961,8 @@ def concat_with_transitions(script, work_dir):
 
     for i in range(1, len(clips)):
         transition = clips[i].get("transition", "fade")
+        if transition not in TRANSITIONS:
+            transition = "fade"
         out_label = f"[v{i}]" if i < len(clips) - 1 else "[vout]"
         aout_label = f"[a{i}]" if i < len(clips) - 1 else "[aout]"
 
