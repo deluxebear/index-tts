@@ -68,12 +68,35 @@ VL_MAX_FRAMES = 256
 # ffprobe result cache (avoids repeated subprocess spawns for the same file)
 _video_info_cache = {}
 
+# ---------------------------------------------------------------------------
+# ffmpeg version detection (for xfade transition compatibility)
+# ---------------------------------------------------------------------------
+
+def _get_ffmpeg_version():
+    """返回 ffmpeg 主版本号，如 (5, 1)。检测失败返回 (4, 0)。"""
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+        m = re.search(r"ffmpeg version (\d+)\.(\d+)", r.stdout)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        pass
+    return (4, 0)
+
+_FFMPEG_VER = _get_ffmpeg_version()
+
 # Available effects for LLM to choose from
-TRANSITIONS = [
+_TRANSITIONS_BASE = [
     "fade", "wipeleft", "wiperight", "slideright", "slideleft",
     "circleopen", "circleclose", "radial", "pixelize", "dissolve",
-    "zoomin", "fadeblack", "fadewhite",
+    "fadeblack", "fadewhite",
 ]
+_TRANSITIONS_5X = [
+    "zoomin", "smoothleft", "smoothright", "smoothup", "smoothdown",
+    "squeezeh", "squeezev", "hlwind", "hrwind", "vuwind", "vdwind",
+    "coverleft", "coverright", "revealleft", "revealright",
+]
+TRANSITIONS = _TRANSITIONS_BASE + (_TRANSITIONS_5X if _FFMPEG_VER >= (5, 0) else [])
 COLOR_GRADES = ["cinematic_warm", "cinematic_cool", "vintage", "high_contrast", "none"]
 SUBTITLE_STYLES = ["word_by_word_highlight", "fade_in", "pop_up", "typewriter"]
 EMOTION_DIMS = ["happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm"]
@@ -1236,6 +1259,7 @@ def create_highlight(
     print(f"Output:  {output_path}")
     print(f"Work:    {video_work_dir}")
     print(f"Target:  {target_duration}s ({target_duration/60:.1f}min)")
+    print(f"ffmpeg:  {_FFMPEG_VER[0]}.{_FFMPEG_VER[1]} ({len(TRANSITIONS)} transitions available)")
     print(f"{'=' * 60}")
 
     # Load checkpoint
