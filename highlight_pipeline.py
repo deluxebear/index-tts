@@ -58,10 +58,11 @@ TTS_SAMPLE_RATE = 24000
 X264_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
 AAC_ARGS = ["-c:a", "aac", "-b:a", "128k"]
 
-# Qwen2.5-VL defaults (tuned for L4 24GB VRAM)
-VL_FPS = 1.0
-VL_TOTAL_PIXELS = 12288 * 28 * 28
+# Qwen2.5-VL defaults (tuned for L4 24GB VRAM with 4-bit quantization)
+VL_FPS = 0.5
+VL_TOTAL_PIXELS = 8192 * 28 * 28
 VL_MIN_PIXELS = 128 * 28 * 28
+VL_MAX_FRAMES = 128
 
 # ffprobe result cache (avoids repeated subprocess spawns for the same file)
 _video_info_cache = {}
@@ -373,7 +374,12 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
     )
     processor = AutoProcessor.from_pretrained(vl_model_name)
 
-    # Build message with video input
+    # Build message with video input (cap frames to avoid OOM)
+    video_info = _get_video_info(video_path)
+    video_dur = video_info["duration"]
+    nframes = min(int(video_dur * VL_FPS), VL_MAX_FRAMES)
+    print(f"  Video: {video_dur:.0f}s, sampling {nframes} frames (max {VL_MAX_FRAMES})")
+
     messages = [
         {
             "role": "user",
@@ -383,7 +389,7 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
                     "video": f"file://{os.path.abspath(video_path)}",
                     "total_pixels": VL_TOTAL_PIXELS,
                     "min_pixels": VL_MIN_PIXELS,
-                    "fps": VL_FPS,
+                    "nframes": nframes,
                 },
                 {"type": "text", "text": prompt},
             ],
