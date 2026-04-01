@@ -62,13 +62,21 @@ def _run_ffmpeg(*args):
 # Checkpoint — save/resume pipeline progress
 # ---------------------------------------------------------------------------
 
+class _CheckpointEncoder(json.JSONEncoder):
+    """JSON encoder that skips numpy arrays (e.g. speaker embeddings)."""
+    def default(self, obj):
+        if type(obj).__name__ == "ndarray":
+            return None  # drop numpy arrays — recomputed on resume
+        return super().default(obj)
+
+
 def _save_checkpoint(work_dir, step, segments=None, **extra):
     """Save pipeline progress after each step."""
     data = {"step": step, "segments": segments}
     data.update(extra)
     path = os.path.join(work_dir, CHECKPOINT_FILE)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False, cls=_CheckpointEncoder)
     print(f"  Checkpoint saved: step {step}")
 
 
@@ -1612,14 +1620,8 @@ def dub_video(
     if done < 5:
         print("\n[Step 4/11] Extracting speaker references...")
         speaker_refs = extract_speaker_refs(segments, vocals_path, video_work_dir, fallback_refs)
-        # Save checkpoint without numpy embeddings (not JSON serializable)
-        serializable_refs = {
-            spk: {k: v for k, v in info.items() if k != "embedding"}
-            for spk, info in speaker_refs.items()
-        }
-        paths["speaker_refs"] = serializable_refs
+        paths["speaker_refs"] = speaker_refs
         _save_checkpoint(video_work_dir, 5, segments=segments, paths=paths)
-        paths["speaker_refs"] = speaker_refs  # restore full refs with embeddings
     else:
         speaker_refs = paths.get("speaker_refs", {})
         # Recompute embeddings when resuming from checkpoint
