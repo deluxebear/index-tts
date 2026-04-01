@@ -219,30 +219,49 @@ def _build_intent_vl_prompt(transcript_text, video_duration_str, intent_plan):
     dimensions_str = "\n".join(
         f"  {i + 1}. {dim}" for i, dim in enumerate(intent_plan.analysis_dimensions)
     )
-    return f"""你是一位{intent_plan.persona}。请分析这个视频（总时长约{video_duration_str}），重点关注以下维度：
+    return f"""你是一位{intent_plan.persona}。请分析这个视频（总时长约{video_duration_str}）。
 
+## 你的任务
+
+用户的创作意图是：**{intent_plan.intent_summary}**
+
+你需要从视频中找出能体现以下维度的**具体片段**：
 {dimensions_str}
 
-创作目标：{intent_plan.intent_summary}
+## 重要：分析方法 vs 内容转述
 
-以下是该视频的语音转录文本，辅助你理解内容：
+你的任务是**识别和标注视频中体现特定技巧/方法/规律的片段**，而不是总结视频讲了什么内容。
+
+举例说明区别：
+- ❌ 内容转述："演讲者讲述了她创建AI伴侣的故事"
+- ✅ 技巧分析："演讲者在02:30使用了个人悲伤故事作为情感锚点，这是一种经典的共情开场技巧"
+- ❌ 内容转述："这段讲了职场中被领导批评的情节"
+- ✅ 规律提炼："这段情节展示了'向上管理'的反面案例——在公开场合反驳领导"
+
+对于每个片段，请回答：**这里体现了什么技巧/方法/规律？为什么这个片段是好的示范或反面案例？**
+
+## 转录文本参考
 {transcript_text}
+
+## 输出格式
 
 请返回严格的JSON格式（不要添加markdown围栏）：
 {{
   "video_type": "视频类型",
   "overall_summary": "整体内容概要（2-3句）",
+  "intent_findings": "与'{intent_plan.intent_summary}'直接相关的核心发现（3-5条，每条指出一个具体的技巧/方法/规律）",
   "events": [
     {{
       "start_time": "起始秒数",
       "end_time": "结束秒数",
-      "description": "事件描述",
-      "visual_highlights": "视觉亮点",
+      "description": "该片段体现了什么技巧/方法/规律（不是内容摘要！）",
+      "technique_name": "技巧/方法的简短命名（如'情感锚点法'、'三段式递进'）",
+      "visual_highlights": "画面中的关键细节（肢体语言、表情、道具等）",
       "emotional_tone": "情感基调描述",
       "emotion_tags": ["从以下选择: happy, angry, sad, afraid, disgusted, melancholic, surprised, calm"],
       "importance": 8,
-      "reason": "为什么这个片段适合/不适合作为精华",
-      "intent_relevance": "与创作意图的相关性说明",
+      "reason": "为什么这个片段适合用来讲解该技巧",
+      "intent_relevance": "与'{intent_plan.intent_summary}'的关联度说明",
       "intent_score": 8
     }}
   ]
@@ -253,8 +272,9 @@ def _build_intent_vl_prompt(transcript_text, video_duration_str, intent_plan):
 - intent_score 评分 1-10，越高越与创作意图相关
 - emotion_tags 必须从这8个中选择: happy, angry, sad, afraid, disgusted, melancholic, surprised, calm
 - 时间戳必须是秒数（如 "123.5"），与视频实际时间对齐
-- 请尽量发现所有有价值的片段，宁多勿少
-- 优先选择与创作意图高度相关的片段"""
+- **description 必须说明技巧/方法，不能只复述视频内容**
+- **technique_name 是必填的，每个片段都要命名所体现的技巧**
+- 请尽量发现所有有价值的片段，宁多勿少"""
 
 
 def analyze_video_with_intent(video_path, transcript, work_dir, intent_plan, vl_model_name="Qwen/Qwen2.5-VL-7B-Instruct"):
@@ -431,28 +451,66 @@ def _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w
 
     tone_str = "、".join(intent_plan.tone_keywords)
 
+    # Build intent-specific narration guidance
+    if intent_plan.content_style in ("analytical", "educational"):
+        narration_guidance = f"""## 旁白写作的关键原则（极其重要！！）
+
+你写的旁白是**对技巧/方法/规律的分析评论**，不是对视频内容的复述！
+
+正确示范：
+- "注意看，这里她用了一个非常高明的技巧——用自己最脆弱的经历来建立共情。这就是演讲中的'情感锚点法'"
+- "她的语速在这里突然放慢了，配合3秒的停顿。这不是紧张，而是刻意为之——让观众有时间消化刚才的信息"
+- "接下来这段很关键——她没有直接给出答案，而是用了三个递进的问题把观众的好奇心拉到最高点"
+
+错误示范（不要这样写！）：
+- "她讲述了自己失去朋友的故事" ← 这是内容复述
+- "AI技术给人类带来了希望" ← 这是内容总结
+- "她创建了一个AI伴侣来缅怀朋友" ← 这是情节概括
+
+每段旁白应该回答：**视频此刻正在使用什么技巧？为什么有效？观众能从中学到什么？**
+
+语气要求：{tone_str}（像一位{intent_plan.persona}在做专业点评）"""
+    else:
+        narration_guidance = f"""## 旁白写作指导
+
+为每个片段编写中文旁白（口语化、有感染力、适合配音朗读）。
+旁白应紧扣用户意图"{intent_plan.intent_summary}"，而非简单转述视频内容。
+语气要求：{tone_str}"""
+
     return f"""你是{intent_plan.persona_prompt}
 
 内容风格：{intent_plan.content_style}
 叙事结构：{intent_plan.narrative_description}
-语气要求：{tone_str}
 开头策略：{intent_plan.hook_strategy}
 
 以下是一个{analysis.get('video_type', '未知')}类型视频的关键事件分析：
 
 整体概要：{analysis.get('overall_summary', '')}
+意图相关发现：{analysis.get('intent_findings', '')}
 
 事件列表：
 {json.dumps(events, ensure_ascii=False, indent=2)}
 
 请从中选取最精华的事件，生成一个约{target_duration}秒的短视频解说脚本。
 
-## 你需要输出：
+{narration_guidance}
 
-1. 为每个选中的片段编写中文旁白（口语化、有感染力、适合配音朗读）
-2. 为每条旁白设计**情感向量**（8维浮点数组，每个0-1）
-3. 为每个片段选择**视觉特效**
-4. 为每个片段设计**花字文案**（fancy_texts）
+## 花字文案写作指导
+
+花字（fancy_texts）是叠加在画面上的文字特效，用来**强调关键信息**。
+
+花字应该写什么：
+- 技巧/方法的名称（如"情感锚点法"、"三段式递进"）
+- 关键数据或数字
+- 核心观点的精炼表达（6-12个字）
+- 观众能记住的金句
+
+花字**不要**写什么：
+- 不要把整段旁白都放到花字里
+- 不要写太长的句子（超过15个字就太长了）
+- 花字必须是**中文**
+
+每个片段至少1个花字，重点片段2-3个。花字 timing 的起止时间是**相对于该片段开始的秒数**。
 
 ## 情感向量说明
 格式：[happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]
@@ -471,7 +529,7 @@ def _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w
   - ken_burns: 缩放平移（适合静态画面）
 标题卡片(title_card): 段落间2-3秒的文字过渡卡（可选）
 
-## 花字特效
+## 花字特效类型
 {effects_desc}
 
 画布尺寸：{canvas_w}x{canvas_h}
@@ -483,8 +541,8 @@ def _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w
 2. 开头必须有hook（{intent_plan.hook_strategy}）
 3. 结尾有总结或金句
 4. 按叙事逻辑排列，确保连贯性
-5. 特效要配合内容情绪
-6. 花字文案简洁有力，配合旁白突出关键信息
+5. 花字文案必须是中文，简洁有力（6-12字），突出技巧名称或核心观点
+6. 每个片段必须包含旁白字幕（effect=subtitle_default），位置在画面底部
 
 请返回严格的JSON数组（不要添加markdown围栏）：
 [
@@ -492,21 +550,29 @@ def _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w
     "segment_id": 0,
     "start_time": 123.5,
     "end_time": 245.8,
-    "narration": "你绝对想不到，接下来发生的事情...",
-    "emo_vector": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6, 0.2],
-    "transition": "circleopen",
+    "narration": "注意看这里，她用了一个非常高明的技巧...",
+    "emo_vector": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+    "transition": "fade",
     "effects": {{
-      "color_grade": "cinematic_warm",
-      "slow_motion": {{"time_range": [130.0, 133.0], "factor": 0.5}}
+      "color_grade": "cinematic_warm"
     }},
-    "title_card": "开头标题文字（可选，设为null表示无）",
+    "title_card": null,
     "fancy_texts": [
       {{
-        "text": "关键金句或数据",
+        "text": "情感锚点法",
         "effect": "pop_zoom",
-        "position": [540, 960],
-        "timing": [0.5, 3.0],
-        "size": 60,
+        "position": [{canvas_w // 2}, {canvas_h // 3}],
+        "timing": [1.0, 4.0],
+        "size": 72,
+        "color": "#FF6B6B",
+        "layer": 1
+      }},
+      {{
+        "text": "旁白字幕文字（和narration一致）",
+        "effect": "subtitle_default",
+        "position": [{canvas_w // 2}, {canvas_h - 200}],
+        "timing": [0.0, 8.0],
+        "size": 44,
         "color": "#FFFFFF",
         "layer": 0
       }}
@@ -837,8 +903,53 @@ def _hex_to_ass_color(hex_color):
     return "&HFFFFFF&"
 
 
+def _ensure_cjk_font():
+    """Ensure a CJK font is available on the system. Returns the font name to use in ASS."""
+    import shutil
+    # Check if Noto Sans SC is already installed
+    fc_list = shutil.which("fc-list")
+    if fc_list:
+        try:
+            result = subprocess.run(
+                ["fc-list", ":lang=zh", "family"],
+                capture_output=True, text=True, timeout=5,
+            )
+            families = result.stdout.strip()
+            if "Noto Sans CJK" in families or "Noto Sans SC" in families:
+                return "Noto Sans SC"
+            if "WenQuanYi" in families:
+                return "WenQuanYi Micro Hei"
+        except Exception:
+            pass
+    # Try to install CJK font (works on Colab/Ubuntu)
+    try:
+        subprocess.run(
+            ["apt-get", "install", "-y", "-qq", "fonts-noto-cjk"],
+            capture_output=True, timeout=60,
+        )
+        # Refresh font cache
+        subprocess.run(["fc-cache", "-f"], capture_output=True, timeout=30)
+        print("  Installed fonts-noto-cjk for Chinese text rendering")
+        return "Noto Sans CJK SC"
+    except Exception:
+        pass
+    return "Noto Sans SC"  # Fallback, hope for the best
+
+
+# Module-level font detection (runs once at import time)
+_CJK_FONT = None
+
+
+def _get_cjk_font():
+    global _CJK_FONT
+    if _CJK_FONT is None:
+        _CJK_FONT = _ensure_cjk_font()
+    return _CJK_FONT
+
+
 def _generate_fancy_ass_header(canvas_w, canvas_h):
     """Generate ASS file header with fancy styles."""
+    font = _get_cjk_font()
     return f"""[Script Info]
 Title: Intent Video Fancy Text
 ScriptType: v4.00+
@@ -848,12 +959,12 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: FancyDefault,Noto Sans SC,52,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,30,30,120,1
-Style: FancyOutline,Noto Sans SC,60,&H00FFFFFF,&H000000FF,&H004040FF,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,5,30,30,120,1
-Style: FancyGlow,Noto Sans SC,64,&H0000FFFF,&H000000FF,&H0000FFFF,&H00000000,-1,0,0,0,100,100,0,0,1,0,4,5,30,30,120,1
-Style: FancyTitle,Noto Sans SC,80,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,5,30,30,400,1
-Style: FancyShadow,Noto Sans SC,64,&H00FFFFFF,&H000000FF,&H00333333,&H00666666,-1,0,0,0,100,100,0,0,1,3,4,5,30,30,120,1
-Style: SubtitleNarr,Noto Sans SC,48,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,3,1,2,30,30,100,1
+Style: FancyDefault,{font},52,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,30,30,120,1
+Style: FancyOutline,{font},60,&H00FFFFFF,&H000000FF,&H004040FF,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,5,30,30,120,1
+Style: FancyGlow,{font},64,&H0000FFFF,&H000000FF,&H0000FFFF,&H00000000,-1,0,0,0,100,100,0,0,1,0,4,5,30,30,120,1
+Style: FancyTitle,{font},80,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,5,30,30,400,1
+Style: FancyShadow,{font},64,&H00FFFFFF,&H000000FF,&H00333333,&H00666666,-1,0,0,0,100,100,0,0,1,3,4,5,30,30,120,1
+Style: SubtitleNarr,{font},48,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,3,1,2,30,30,100,1
 Style: ProgressBar,Arial,10,&H0000BFFF,&H000000FF,&H0000BFFF,&H0000BFFF,0,0,0,0,100,100,0,0,3,0,0,7,0,0,0,1
 
 [Events]
