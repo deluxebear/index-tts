@@ -158,6 +158,7 @@ def get_audio_duration(path):
 
 def _save_checkpoint(work_dir, step, **data):
     """Save pipeline progress after each step."""
+    data.pop("step", None)
     data["step"] = step
     path = os.path.join(work_dir, CHECKPOINT_FILE)
     with open(path, "w", encoding="utf-8") as f:
