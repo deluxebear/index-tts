@@ -420,7 +420,7 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
     ).to(model.device)
 
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=4096)
+        generated_ids = model.generate(**inputs, max_new_tokens=8192)
     # Trim input tokens
     generated_ids_trimmed = [
         out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -447,7 +447,11 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
 
 
 def _parse_json_response(text):
-    """Parse JSON from LLM/VL response, stripping markdown fences."""
+    """Parse JSON from LLM/VL response, stripping markdown fences.
+
+    Handles truncated JSON by attempting to repair incomplete output
+    (e.g. closing unclosed arrays/objects).
+    """
     # Strip markdown code fences
     text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"```\s*$", "", text)
@@ -455,15 +459,47 @@ def _parse_json_response(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to find JSON object/array in text
-        for pattern in [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    return json.loads(match.group())
-                except json.JSONDecodeError:
-                    continue
-    return None
+        pass
+    # Try to find JSON object/array in text
+    for pattern in [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                continue
+    # Try to repair truncated JSON (output cut off by max_new_tokens)
+    return _repair_truncated_json(text)
+
+
+def _repair_truncated_json(text):
+    """Attempt to repair truncated JSON by closing unclosed structures."""
+    # Find the start of the JSON object
+    start = text.find("{")
+    if start < 0:
+        return None
+    text = text[start:]
+    # Truncate at the last complete value boundary (after , or after })
+    # Remove trailing incomplete key-value pair
+    text = re.sub(r',\s*"[^"]*"?\s*:?\s*("(?:[^"\\]|\\.)*)?$', "", text)
+    text = re.sub(r',\s*\{[^}]*$', "", text)  # remove trailing incomplete object in array
+    # Count unclosed brackets and close them
+    opens = 0
+    open_sq = 0
+    for ch in text:
+        if ch == "{":
+            opens += 1
+        elif ch == "}":
+            opens -= 1
+        elif ch == "[":
+            open_sq += 1
+        elif ch == "]":
+            open_sq -= 1
+    text += "]" * open_sq + "}" * opens
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
 
 # ---------------------------------------------------------------------------
