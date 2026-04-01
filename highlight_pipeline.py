@@ -383,10 +383,14 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
     sampled_video = os.path.join(work_dir, "vl_sampled.mp4")
     if not os.path.exists(sampled_video):
         print(f"  Pre-extracting {nframes} frames from {video_dur:.0f}s video (ffmpeg)...")
+        # Use -vsync vfr + output fps to ensure metadata duration matches actual frames
+        out_fps = max(1, nframes // max(1, int(video_dur // nframes)))
         _run_ffmpeg(
             "-i", video_path,
             "-vf", f"fps={extract_fps:.6f},scale=480:-2",
             "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-r", str(out_fps),
+            "-vsync", "cfr",
             sampled_video,
         )
     else:
