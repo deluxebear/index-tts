@@ -375,39 +375,36 @@ def analyze_video(video_path, transcript, work_dir, vl_model_name="Qwen/Qwen2.5-
     )
     processor = AutoProcessor.from_pretrained(vl_model_name)
 
-    # Pre-extract frames as JPEG images to bypass torchvision video decoding entirely
+    # Pre-extract a short sampled video with ffmpeg to avoid torchvision decoding
+    # the full original video into RAM. The sampled video preserves native video
+    # format so Qwen2.5-VL can use its temporal position encoding and motion understanding.
     video_info = _get_video_info(video_path)
     video_dur = video_info["duration"]
     nframes = min(int(video_dur * VL_FPS), VL_MAX_FRAMES)
     extract_fps = nframes / video_dur if video_dur > 0 else VL_FPS
-    frames_dir = os.path.join(work_dir, "vl_frames")
-    os.makedirs(frames_dir, exist_ok=True)
-    frame_pattern = os.path.join(frames_dir, "frame_%04d.jpg")
-    existing_frames = sorted(
-        f for f in os.listdir(frames_dir) if f.startswith("frame_") and f.endswith(".jpg")
-    ) if os.path.isdir(frames_dir) else []
-    if not existing_frames:
-        print(f"  Extracting {nframes} frames from {video_dur:.0f}s video (ffmpeg)...")
+    sampled_video = os.path.join(work_dir, "vl_sampled.mp4")
+    if not os.path.exists(sampled_video):
+        print(f"  Pre-extracting {nframes} frames from {video_dur:.0f}s video (ffmpeg)...")
         _run_ffmpeg(
             "-i", video_path,
             "-vf", f"fps={extract_fps:.6f},scale=480:-2",
-            "-q:v", "5",
-            frame_pattern,
+            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-pix_fmt", "rgb24",
+            sampled_video,
         )
-        existing_frames = sorted(
-            f for f in os.listdir(frames_dir) if f.startswith("frame_") and f.endswith(".jpg")
-        )
-    print(f"  Using {len(existing_frames)} extracted frames")
+    else:
+        print(f"  Using cached sampled video ({nframes} frames)")
 
-    # Pass frames as image list — bypasses torchvision/torchcodec video readers
-    frame_paths = [f"file://{os.path.abspath(os.path.join(frames_dir, f))}" for f in existing_frames]
+    # Limit swscaler threads to prevent resource exhaustion on Colab
+    os.environ["SWS_MAX_FILTER_SIZE"] = "1"
+
     messages = [
         {
             "role": "user",
             "content": [
                 {
                     "type": "video",
-                    "video": frame_paths,
+                    "video": f"file://{os.path.abspath(sampled_video)}",
                     "total_pixels": VL_TOTAL_PIXELS,
                     "min_pixels": VL_MIN_PIXELS,
                 },
