@@ -191,6 +191,32 @@ def _init_tts(model_dir, use_fp16):
     )
 
 
+def _offload_tts(tts):
+    """Move TTS model to CPU to free GPU VRAM for other steps."""
+    import torch
+    if tts is None or not torch.cuda.is_available():
+        return
+    for name in ("gpt", "s2mel", "bigvgan", "campplus_model",
+                 "semantic_model", "semantic_codec"):
+        model = getattr(tts, name, None)
+        if model is not None:
+            model.cpu()
+    torch.cuda.empty_cache()
+
+
+def _reload_tts(tts):
+    """Move TTS model back to GPU for inference."""
+    import torch
+    if tts is None or not torch.cuda.is_available():
+        return
+    device = tts.device
+    for name in ("gpt", "s2mel", "bigvgan", "campplus_model",
+                 "semantic_model", "semantic_codec"):
+        model = getattr(tts, name, None)
+        if model is not None:
+            model.to(device)
+
+
 def transcribe_and_diarize(vocals_path, hf_token, num_speakers=None):
     """Transcribe with word-level timestamps and speaker labels."""
     import whisperx
@@ -1574,6 +1600,10 @@ def dub_video(
     segments = ckpt.get("segments") if ckpt else None
     paths = ckpt.get("paths", {}) if ckpt else {}
 
+    # Free GPU for demucs/whisperx steps (TTS not needed until Step 6)
+    if done < 7:
+        _offload_tts(tts)
+
     # --- Step 1: Extract tracks ---
     if done < 1:
         print("\n[Step 1/11] Extracting audio and video tracks...")
@@ -1667,6 +1697,7 @@ def dub_video(
     # --- Step 6: TTS generation ---
     if done < 7:
         print("\n[Step 6/11] Generating Chinese speech with IndexTTS2...")
+        _reload_tts(tts)
         if tts is None:
             tts = _init_tts(model_dir, use_fp16)
         segments = generate_speech(segments, speaker_refs, vocals_path, video_work_dir, tts)
