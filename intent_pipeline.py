@@ -424,10 +424,53 @@ def analyze_video_with_intent(video_path, transcript, work_dir, intent_plan, vl_
 # Step 4: Intent-driven script generation
 # ---------------------------------------------------------------------------
 
-def _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w, canvas_h):
+def _attach_transcript_to_events(events, transcript):
+    """为每个 event 附加对应时间范围内的转录文本。"""
+    for event in events:
+        start = float(event.get("start_time", 0))
+        end = float(event.get("end_time", 0))
+        matching = [
+            seg["text"] for seg in transcript
+            if seg.get("end", 0) >= start and seg.get("start", 0) <= end
+        ]
+        event["transcript_text"] = " ".join(matching).strip() if matching else ""
+    return events
+
+
+def _validate_segment_times(script, events):
+    """确保脚本时间戳与 VL 事件时间重叠，不允许凭空编造。"""
+    event_ranges = []
+    for e in events:
+        try:
+            event_ranges.append((float(e["start_time"]), float(e["end_time"])))
+        except (KeyError, ValueError):
+            continue
+    if not event_ranges:
+        return script
+
+    for item in script:
+        start, end = item["start_time"], item["end_time"]
+        # 检查是否与任何 VL 事件有重叠
+        overlap = any(s <= end and e >= start for s, e in event_ranges)
+        if not overlap:
+            # 找最近的事件
+            closest = min(event_ranges, key=lambda r: min(abs(r[0] - start), abs(r[1] - end)))
+            print(f"  [WARN] Segment {item.get('segment_id')}: "
+                  f"time {start:.1f}-{end:.1f}s has no VL event overlap, "
+                  f"snapping to {closest[0]:.1f}-{closest[1]:.1f}s")
+            item["start_time"] = closest[0]
+            item["end_time"] = closest[1]
+    return script
+
+
+def _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w, canvas_h, transcript=None):
     """Build script generation prompt tailored to the intent plan."""
     events = analysis.get("events", [])
     events = [e for e in events if e.get("importance", 0) >= MIN_IMPORTANCE]
+
+    # Attach transcript text to each event so LLM knows what's actually said
+    if transcript:
+        events = _attach_transcript_to_events(events, transcript)
 
     effects_desc = """可用花字特效列表（fancy_texts中使用）:
   - pop_zoom: 弹出缩放（文字从小弹大再回弹）
@@ -536,6 +579,31 @@ def _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w
 花字密度建议：{intent_plan.fancy_text_guidance.get('density', 'medium')}
 花字风格建议：{intent_plan.fancy_text_guidance.get('style_tone', 'clean')}
 
+## 时间戳规则（极其重要！！）
+- start_time 和 end_time **必须从上方事件列表中选取**，不能自己编造
+- 你可以选择事件列表中某个事件的完整时间范围，或合并相邻事件
+- 绝对不要使用事件列表中不存在的时间范围
+- 每个事件都附有 transcript_text 字段，那是该时间段内视频里**实际说的台词**
+
+## 画面同步原则（抖音讲解风格，极其重要！！）
+旁白必须与画面同步——观众看到什么、听到什么，你就评论什么。
+
+正确示范：
+- 画面：演讲者站在台上，双手张开
+  旁白："注意看她此刻的肢体语言——双手完全打开，这是一种典型的'敞开式'站姿"
+- 画面：演讲者停顿3秒，transcript_text 为空
+  旁白："她在这里做了一个长达3秒的停顿，这就是'沉默的力量'"
+
+错误示范（绝对禁止！）：
+- 旁白提到了视频里根本没有的画面或事件 ← 脑补！
+- 旁白描述了视频里没有说过的台词 ← 编造！
+- 旁白的描述和 transcript_text 的内容矛盾 ← 不忠实！
+
+规则：
+1. 只评论该时间段画面中**实际可见**或 transcript_text 中**实际说到**的内容
+2. 利用 transcript_text 确认演讲者在该片段里说了什么，你的评论要基于这些真实台词
+3. 不要编造视频里没有的细节、场景、表情或动作
+
 ## 要求
 1. 总旁白时长控制在{target_duration}秒左右
 2. 开头必须有hook（{intent_plan.hook_strategy}）
@@ -581,9 +649,9 @@ def _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w
 ]"""
 
 
-def generate_intent_script(analysis, intent_plan, llm_client, target_duration, canvas_w, canvas_h):
+def generate_intent_script(analysis, intent_plan, llm_client, target_duration, canvas_w, canvas_h, transcript=None):
     """Generate narration script with fancy text choreography, driven by intent plan."""
-    prompt = _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w, canvas_h)
+    prompt = _build_intent_script_prompt(analysis, intent_plan, target_duration, canvas_w, canvas_h, transcript=transcript)
 
     print("  Generating intent-driven script...")
     response = llm_client.chat(prompt, temperature=0.7)
@@ -656,6 +724,10 @@ def generate_intent_script(analysis, intent_plan, llm_client, target_duration, c
                 validated_fancy.append(vft)
         cleaned_item["fancy_texts"] = validated_fancy
         cleaned.append(cleaned_item)
+
+    # Validate segment times against VL events
+    all_events = analysis.get("events", [])
+    cleaned = _validate_segment_times(cleaned, all_events)
 
     print(f"  Script generated: {len(cleaned)} segments")
     for i, item in enumerate(cleaned):
@@ -1418,7 +1490,7 @@ def create_intent_video(
     if done < 5:
         print("\n[Step 4/6] Generating intent-driven script and effects...")
         llm_client = LLMClient(api_key=llm_api_key, api_base=llm_api_base, model=llm_model)
-        script = generate_intent_script(analysis, intent_plan, llm_client, target_duration, canvas_w, canvas_h)
+        script = generate_intent_script(analysis, intent_plan, llm_client, target_duration, canvas_w, canvas_h, transcript=transcript)
         script_path = os.path.join(video_work_dir, "intent_script.json")
         with open(script_path, "w", encoding="utf-8") as f:
             json.dump(script, f, ensure_ascii=False, indent=2)
