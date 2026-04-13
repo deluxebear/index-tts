@@ -1656,7 +1656,7 @@ def dub_video(
         speaker_refs = paths.get("speaker_refs", {})
         # Recompute embeddings when resuming from checkpoint
         for spk, info in speaker_refs.items():
-            if "embedding" not in info and os.path.exists(info.get("best_auto", "")):
+            if info.get("embedding") is None and os.path.exists(info.get("best_auto", "")):
                 info["embedding"] = _compute_speaker_embedding(info["best_auto"])
         print(f"\n[Step 4/11] Skipped (cached)")
 
