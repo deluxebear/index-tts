@@ -1155,17 +1155,24 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
 # Step 7: Duration alignment (with gap absorption)
 # ---------------------------------------------------------------------------
 
-def align_durations(segments, work_dir):
-    """Align generated audio with 50/50 burden split between audio and video.
+def align_durations(segments, work_dir, audio_only_align=False):
+    """Align generated audio with optional video slowdown.
 
+    When audio_only_align=False (default):
     - ratio <= AUDIO_COMFORT_LIMIT (1.2): audio-only speedup
     - ratio > AUDIO_COMFORT_LIMIT: audio caps at 1.2x, video slows down the rest
-    - Stores seg["video_slowdown"] for later video processing
+
+    When audio_only_align=True:
+    - Audio absorbs all time difference (no video re-encoding needed)
+    - Much faster assembly via -c:v copy, but speech may sound faster
     """
     import pyrubberband as pyrb
 
     aligned_dir = os.path.join(work_dir, "aligned")
     os.makedirs(aligned_dir, exist_ok=True)
+
+    if audio_only_align:
+        print("  Audio-only alignment mode: no video slowdown")
 
     for i, seg in enumerate(segments):
         if seg.get("wav_path") is None:
@@ -1193,7 +1200,10 @@ def align_durations(segments, work_dir):
         audio, sr = sf.read(seg["wav_path"])
 
         if ratio > 1.0:
-            if ratio <= AUDIO_COMFORT_LIMIT:
+            if audio_only_align:
+                audio_rate = ratio
+                seg["video_slowdown"] = 1.0
+            elif ratio <= AUDIO_COMFORT_LIMIT:
                 audio_rate = ratio
                 seg["video_slowdown"] = 1.0
             else:
@@ -1579,6 +1589,7 @@ def dub_video(
     cleanup=False,
     external_subs=None,
     no_external_subs=False,
+    audio_only_align=False,
 ):
     """
     Main pipeline: dub an English video into Chinese.
@@ -1599,6 +1610,8 @@ def dub_video(
         cleanup: Delete intermediate files after successful completion.
         external_subs: Explicit path to external subtitle file (.srt/.ass).
         no_external_subs: Disable auto-discovery of external subtitles.
+        audio_only_align: Audio absorbs all time difference (no video slowdown).
+            Much faster assembly (uses -c:v copy), but speech may be faster.
     """
     video_path = str(video_path)
     if output_path is None:
@@ -1728,7 +1741,7 @@ def dub_video(
     # --- Step 7: Duration alignment (with 50/50 video slowdown) ---
     if done < 8:
         print("\n[Step 7/11] Aligning durations (audio + video)...")
-        segments = align_durations(segments, video_work_dir)
+        segments = align_durations(segments, video_work_dir, audio_only_align=audio_only_align)
         _save_checkpoint(video_work_dir, 8, segments=segments, paths=paths)
     else:
         print(f"\n[Step 7/11] Skipped (cached)")
@@ -1868,6 +1881,8 @@ def main():
     parser.add_argument("--cleanup", action="store_true", help="Delete intermediate files after completion")
     parser.add_argument("--external-subs", default=None, help="Path to external subtitle file (.srt or .ass)")
     parser.add_argument("--no-external-subs", action="store_true", help="Disable auto-discovery of external subtitles")
+    parser.add_argument("--audio-only-align", action="store_true",
+                        help="Audio absorbs all time difference (no video slowdown/re-encoding, much faster)")
 
     args = parser.parse_args()
 
@@ -1894,6 +1909,7 @@ def main():
         cleanup=args.cleanup,
         external_subs=args.external_subs,
         no_external_subs=args.no_external_subs,
+        audio_only_align=args.audio_only_align,
     )
 
     if args.batch:
