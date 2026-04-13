@@ -1293,56 +1293,76 @@ def compute_shifted_timeline(segments, video_duration):
 
 
 def _build_video_with_slowdowns(video_only_path, timeline, video_duration, output_path):
-    """Rebuild video with per-segment slowdowns using ffmpeg filter_complex."""
+    """Rebuild video with per-segment slowdowns using ffmpeg filter_complex.
+
+    Merges consecutive normal-speed regions (gaps + segments with slowdown=1.0)
+    into single trim operations to keep the filter graph small. Uses a script
+    file instead of a command-line argument to avoid OS arg-length limits.
+    """
+    # Build a flat list of (start, end, slowdown) covering the full video.
+    # Normal-speed entries use slowdown=1.0.
+    raw_entries = []
+    prev_end = 0.0
+    for (orig_start, orig_end, _, _, slowdown) in timeline:
+        if orig_start > prev_end + 0.01:
+            raw_entries.append((prev_end, orig_start, 1.0))
+        raw_entries.append((orig_start, orig_end, slowdown if slowdown > 1.01 else 1.0))
+        prev_end = orig_end
+    if prev_end < video_duration - 0.01:
+        raw_entries.append((prev_end, video_duration, 1.0))
+
+    # Merge consecutive normal-speed (1.0) entries into single trims.
+    merged = []
+    for entry in raw_entries:
+        if (merged and entry[2] == 1.0
+                and merged[-1][2] == 1.0
+                and abs(entry[0] - merged[-1][1]) < 0.02):
+            merged[-1] = (merged[-1][0], entry[1], 1.0)
+        else:
+            merged.append(entry)
+
+    n_original = len(raw_entries)
+    print(f"  Timeline: {n_original} raw entries → {len(merged)} after merging "
+          f"({sum(1 for _, _, s in merged if s > 1.01)} slowdowns)")
+
     filter_parts = []
     concat_inputs = []
-    idx = 0
-    prev_end = 0.0
-
-    for (orig_start, orig_end, _, _, slowdown) in timeline:
-        # Passthrough gap before this segment
-        if orig_start > prev_end + 0.01:
-            label = f"v{idx}"
-            filter_parts.append(
-                f"[0:v]trim={prev_end:.3f}:{orig_start:.3f},setpts=PTS-STARTPTS[{label}]"
-            )
-            concat_inputs.append(f"[{label}]")
-            idx += 1
-
+    for idx, (start, end, slowdown) in enumerate(merged):
         label = f"v{idx}"
         if slowdown > 1.01:
             filter_parts.append(
-                f"[0:v]trim={orig_start:.3f}:{orig_end:.3f},setpts={slowdown:.4f}*(PTS-STARTPTS)[{label}]"
+                f"[0:v]trim={start:.3f}:{end:.3f},setpts={slowdown:.4f}*(PTS-STARTPTS)[{label}]"
             )
         else:
-            filter_parts.append(
-                f"[0:v]trim={orig_start:.3f}:{orig_end:.3f},setpts=PTS-STARTPTS[{label}]"
-            )
+            if end >= video_duration - 0.01:
+                filter_parts.append(
+                    f"[0:v]trim={start:.3f},setpts=PTS-STARTPTS[{label}]"
+                )
+            else:
+                filter_parts.append(
+                    f"[0:v]trim={start:.3f}:{end:.3f},setpts=PTS-STARTPTS[{label}]"
+                )
         concat_inputs.append(f"[{label}]")
-        idx += 1
-        prev_end = orig_end
 
-    # Tail after last segment
-    if prev_end < video_duration - 0.01:
-        label = f"v{idx}"
-        filter_parts.append(
-            f"[0:v]trim={prev_end:.3f},setpts=PTS-STARTPTS[{label}]"
-        )
-        concat_inputs.append(f"[{label}]")
-        idx += 1
-
+    n = len(merged)
     concat_str = "".join(concat_inputs)
-    filter_parts.append(f"{concat_str}concat=n={idx}:v=1:a=0[vout]")
+    filter_parts.append(f"{concat_str}concat=n={n}:v=1:a=0[vout]")
     filter_complex = ";".join(filter_parts)
+
+    # Write filter to a script file to avoid OS command-line length limits.
+    filter_script = os.path.join(os.path.dirname(output_path) or ".", "_filter.txt")
+    with open(filter_script, "w") as f:
+        f.write(filter_complex)
 
     _run_ffmpeg(
         "-i", video_only_path,
-        "-filter_complex", filter_complex,
+        "-filter_complex_script", filter_script,
         "-map", "[vout]",
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-an",
         output_path,
     )
+    os.remove(filter_script)
     print(f"  Built slowdown video: {output_path}")
 
 
