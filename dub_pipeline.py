@@ -1100,6 +1100,89 @@ def load_external_subtitles(video_path, segments):
     return segments, f"{source_desc}:{Path(sub_path).name}"
 
 
+def _cue_speaker_and_text(cue, sorted_asr):
+    """Pick the speaker with the most time-overlap with this cue, and collect
+    the overlapping ASR (original-language) text for the EN subtitle output.
+
+    sorted_asr must be sorted by 'start'. Returns (speaker_or_None, en_text).
+    """
+    overlap_by_spk = {}
+    texts = []
+    for seg in sorted_asr:
+        if seg["start"] >= cue["end"]:
+            break  # sorted by start: nothing after this can overlap
+        ov = min(cue["end"], seg["end"]) - max(cue["start"], seg["start"])
+        if ov <= 0:
+            continue
+        spk = seg.get("speaker", "UNKNOWN")
+        overlap_by_spk[spk] = overlap_by_spk.get(spk, 0.0) + ov
+        if seg.get("text", "").strip():
+            texts.append((seg["start"], seg["text"].strip()))
+    spk = max(overlap_by_spk, key=overlap_by_spk.get) if overlap_by_spk else None
+    texts.sort(key=lambda x: x[0])
+    return spk, " ".join(t for _, t in texts)
+
+
+def build_subtitle_driven_segments(video_path, asr_segments, external_subs=None):
+    """Use each external subtitle cue directly as a synthesis unit.
+
+    When a complete Chinese subtitle is provided, the cue's own (start, end, text)
+    becomes a segment, and the speaker is assigned from the ASR diarization by
+    time overlap. This avoids grafting whole-cue text onto ASR segments — which
+    duplicates text when cues are coarser than ASR segments and drops text when
+    cues are finer (see match_srt_to_segments).
+
+    Returns (segments, source_desc) with zh_text pre-filled on every segment,
+    or (None, None) to fall back to the ASR + LLM translation path.
+    """
+    sub_path, lang_hint = discover_subtitle(external_subs or video_path)
+    if sub_path is None:
+        return None, None
+    if lang_hint == "en":
+        print("  Found English-only subtitle, will use LLM translation instead")
+        return None, None
+
+    parser = parse_ass if sub_path.endswith(".ass") else parse_srt
+    cues = parser(sub_path)
+    if not cues:
+        print(f"  Warning: subtitle file is empty: {sub_path}")
+        return None, None
+
+    cues = clean_subtitle_cues(cues)
+    if not cues:
+        print("  Warning: all subtitle cues were non-dialogue, skipping")
+        return None, None
+
+    source_desc = lang_hint
+    if lang_hint == "zht":
+        print("  Converting Traditional Chinese → Simplified Chinese...")
+        cues = convert_traditional_to_simplified(cues)
+        source_desc = "zht→zh"
+
+    # Default speaker for cues with no ASR overlap = most frequent ASR speaker.
+    spk_counts = {}
+    for s in asr_segments:
+        spk = s.get("speaker", "SPEAKER_00")
+        spk_counts[spk] = spk_counts.get(spk, 0) + 1
+    default_spk = max(spk_counts, key=spk_counts.get) if spk_counts else "SPEAKER_00"
+
+    sorted_asr = sorted(asr_segments, key=lambda s: s["start"])
+    segments = []
+    for cue in sorted(cues, key=lambda c: c["start"]):
+        spk, en_text = _cue_speaker_and_text(cue, sorted_asr)
+        segments.append({
+            "start": cue["start"],
+            "end": cue["end"],
+            "text": en_text,            # original language, best-effort for EN subtitle
+            "zh_text": cue["text"],     # the Chinese to speak (verbatim from subtitle)
+            "speaker": spk or default_spk,
+        })
+
+    print(f"  Subtitle-driven: {len(segments)} cues used as segments "
+          f"(ASR had {len(asr_segments)} segments)")
+    return segments, f"{source_desc}:{Path(sub_path).name}"
+
+
 # ---------------------------------------------------------------------------
 # Step 6: TTS generation with IndexTTS2
 # ---------------------------------------------------------------------------
@@ -1697,17 +1780,22 @@ def dub_video(
     if done < 6:
         print("\n[Step 5/11] Translating to Chinese...")
 
-        # Try external subtitles first
-        if no_external_subs:
-            sub_source = None
-        else:
-            ext_sub = external_subs or video_path
-            segments, sub_source = load_external_subtitles(ext_sub, segments)
+        # Subtitle-driven mode: when a complete external subtitle is provided,
+        # use each cue directly as a synthesis unit (cue timing + text + speaker
+        # from ASR overlap) instead of grafting cue text onto ASR segments.
+        sub_source = None
+        if not no_external_subs:
+            sub_segments, sub_source = build_subtitle_driven_segments(
+                video_path, segments, external_subs=external_subs
+            )
+            if sub_segments is not None:
+                segments = absorb_gaps(sub_segments)  # rebuild end_padded for cue units
+                print(f"  Using subtitle-driven segments ({sub_source})")
 
         untranslated = sum(1 for s in segments if not s.get("zh_text") and s.get("text", "").strip())
 
         if sub_source and untranslated == 0:
-            print(f"  All segments matched from external subtitles ({sub_source})")
+            print(f"  All segments from external subtitles ({sub_source})")
         else:
             if sub_source:
                 print(f"  {len(segments) - untranslated} from external subs, {untranslated} need LLM")
