@@ -1887,6 +1887,7 @@ def dub_batch(
     input_dir,
     output_dir=None,
     video_extensions=(".mp4", ".mkv", ".mov", ".avi"),
+    recursive=False,
     **kwargs,
 ):
     """
@@ -1896,6 +1897,9 @@ def dub_batch(
         input_dir: Input directory containing video files.
         output_dir: Output directory. Defaults to {input_dir}_cn/.
         video_extensions: Tuple of video file extensions to process.
+        recursive: Recurse into subdirectories, preserving their structure in
+            the output (and per-video work dir) so same-named videos in
+            different folders don't collide.
         **kwargs: All other arguments passed to dub_video().
     """
     input_dir = Path(input_dir)
@@ -1904,32 +1908,52 @@ def dub_batch(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    videos = sorted(
-        f for f in input_dir.iterdir() if f.suffix.lower() in video_extensions
-    )
+    out_resolved = output_dir.resolve()
+    base_work_dir = kwargs.pop("work_dir", "dub_workspace")
+
+    if recursive:
+        candidates = sorted(input_dir.rglob("*"))
+    else:
+        candidates = sorted(input_dir.iterdir())
+
+    videos = []
+    for f in candidates:
+        if f.suffix.lower() not in video_extensions:
+            continue
+        # Skip our own outputs (when output_dir lives inside input_dir)
+        if f.stem.endswith("_cn") or out_resolved in f.resolve().parents:
+            continue
+        videos.append(f)
 
     if not videos:
-        print(f"No video files found in {input_dir}")
+        where = "recursively in" if recursive else "in"
+        print(f"No video files found {where} {input_dir}")
         return
 
-    print(f"Found {len(videos)} videos to process")
+    print(f"Found {len(videos)} videos to process{' (recursive)' if recursive else ''}")
     print(f"Output directory: {output_dir}")
 
     tts = _init_tts(kwargs.get("model_dir", "checkpoints"), kwargs.get("use_fp16", True))
 
     results = []
     for i, video in enumerate(videos):
+        # Relative path (without suffix) preserves subdir structure in outputs
+        rel = video.relative_to(input_dir).with_suffix("")
         print(f"\n{'#' * 60}")
-        print(f"[{i + 1}/{len(videos)}] {video.name}")
+        print(f"[{i + 1}/{len(videos)}] {rel}")
         print(f"{'#' * 60}")
 
-        out_path = str(output_dir / f"{video.stem}_cn.mp4")
+        out_path = output_dir / f"{rel}_cn.mp4"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path = str(out_path)
+        # Mirror subdir structure in the work dir to avoid same-stem collisions
+        video_work_dir = os.path.join(base_work_dir, *rel.parent.parts) if rel.parent.parts else base_work_dir
         try:
-            dub_video(str(video), out_path, tts=tts, **kwargs)
-            results.append((video.name, "OK", out_path))
+            dub_video(str(video), out_path, tts=tts, work_dir=video_work_dir, **kwargs)
+            results.append((str(rel), "OK", out_path))
         except Exception as e:
-            print(f"FAILED: {video.name} — {e}")
-            results.append((video.name, "FAILED", str(e)))
+            print(f"FAILED: {rel} — {e}")
+            results.append((str(rel), "FAILED", str(e)))
             continue
 
     print(f"\n{'=' * 60}")
@@ -1957,6 +1981,7 @@ def main():
         help="Output file or directory. Default: {input}_cn.mp4 or {input_dir}_cn/",
     )
     parser.add_argument("--batch", action="store_true", help="Batch mode: process all videos in input directory")
+    parser.add_argument("--recursive", action="store_true", help="Batch mode: recurse into subdirectories (preserves folder structure in output)")
     parser.add_argument("--work-dir", default="dub_workspace", help="Working directory for intermediate files")
     parser.add_argument("--model-dir", default="checkpoints", help="IndexTTS2 model directory")
     parser.add_argument("--fp16", action="store_true", default=True, help="Use FP16 inference (default: True)")
@@ -2001,7 +2026,7 @@ def main():
     )
 
     if args.batch:
-        dub_batch(args.input, args.output, **common_kwargs)
+        dub_batch(args.input, args.output, recursive=args.recursive, **common_kwargs)
     else:
         dub_video(args.input, args.output, **common_kwargs)
 
