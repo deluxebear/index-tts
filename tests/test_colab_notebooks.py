@@ -25,6 +25,9 @@ def test_main_notebook_is_webui_path():
     assert 'IndexTeam/IndexTTS-2"' not in text
     assert "numpy<2.0" not in text
     assert "pip uninstall -y torch" not in text
+    assert "Path(LOCAL_FALLBACK).mkdir" not in text
+    assert "os.makedirs(LOCAL_FALLBACK" not in text
+    assert 'raise SystemExit("pip install failed")' in text
 
 
 def test_pipeline_notebooks_share_cache_and_v25():

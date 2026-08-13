@@ -46,7 +46,8 @@ def test_build_webui_argv_includes_fp16_and_optional_share():
     argv = build_webui_argv(
         port=7860, version="2.5", model_dir="/ckpt", fp16=True, share=False
     )
-    assert argv[1].endswith("webui.py")
+    assert argv[1] == "-u"
+    assert argv[2].endswith("webui.py")
     assert argv[argv.index("--port") + 1] == "7860"
     assert argv[argv.index("--version") + 1] == "2.5"
     assert argv[argv.index("--model_dir") + 1] == "/ckpt"

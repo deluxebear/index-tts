@@ -813,6 +813,7 @@ def generate_narration_with_profile(script, ref_audio, work_dir, intent_plan, mo
                 spk_audio_prompt=ref_audio,
                 text=narration,
                 output_path=output_path,
+                lang="zh",
                 emo_vector=emo_vector,
                 verbose=False,
             )

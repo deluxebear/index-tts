@@ -183,11 +183,11 @@ def _detect_device():
 
 def _init_tts(model_dir, use_fp16):
     """Initialize IndexTTS2 model."""
-    from indextts.infer_v2 import IndexTTS2
+    from indextts.infer_v2_5 import IndexTTS2
     return IndexTTS2(
         cfg_path=os.path.join(model_dir, "config.yaml"),
         model_dir=model_dir,
-        use_fp16=use_fp16,
+        use_bf16=bool(use_fp16),
     )
 
 
@@ -1219,6 +1219,7 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
                 spk_audio_prompt=ref_audio,
                 text=zh_text,
                 output_path=output_path,
+                lang="zh",
                 emo_audio_prompt=ref_audio,
                 verbose=False,
             )

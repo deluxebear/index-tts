@@ -70,6 +70,7 @@ def build_webui_argv(
 ) -> list[str]:
     argv = [
         sys.executable,
+        "-u",
         str(repo_root() / "webui.py"),
         "--host",
         host,
@@ -232,6 +233,7 @@ def start_cloudflare_tunnel(port: int) -> str | None:
             break
         time.sleep(0.2)
     print("cloudflared did not produce a trycloudflare.com URL in time")
+    _stop_cloudflare_tunnel()
     return None
 
 
@@ -245,6 +247,7 @@ def _spawn_webui(argv: list[str]) -> subprocess.Popen[str]:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
     _webui_proc = proc
 
