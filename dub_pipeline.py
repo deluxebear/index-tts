@@ -1732,6 +1732,152 @@ def generate_srt(segments, output_path, lang="zh"):
 
 
 # ---------------------------------------------------------------------------
+# Patch / re-dub specific sentences (no full pipeline rerun)
+# ---------------------------------------------------------------------------
+
+def _video_work_dir(work_dir, video_path):
+    return os.path.join(work_dir, Path(video_path).stem)
+
+
+def _load_work_state(work_dir, video_path):
+    video_work_dir = _video_work_dir(work_dir, video_path)
+    ckpt = _load_checkpoint(video_work_dir)
+    if not ckpt or not ckpt.get("segments"):
+        raise FileNotFoundError(
+            f"No usable checkpoint in {video_work_dir}. Run dub_video first."
+        )
+    return video_work_dir, ckpt
+
+
+def list_dub_segments(video_path, work_dir="dub_workspace"):
+    """Print [id] speaker start-end zh_text from a previous dub_video run."""
+    _video_work_dir_path, ckpt = _load_work_state(work_dir, video_path)
+    segments = ckpt["segments"]
+    print(f"  {len(segments)} segments in {_video_work_dir_path}")
+    rows = []
+    for i, seg in enumerate(segments):
+        zh = (seg.get("zh_text") or "").replace("\n", " ")
+        print(
+            f"[{i:3d}] {str(seg.get('speaker', '?')):12} "
+            f"{seg['start']:7.1f}-{seg['end']:7.1f}  {zh}"
+        )
+        rows.append({"id": i, "speaker": seg.get("speaker"), "start": seg["start"],
+                     "end": seg["end"], "zh_text": seg.get("zh_text", ""),
+                     "text": seg.get("text", "")})
+    return rows
+
+
+def parse_redub_file(path):
+    """Parse `id<TAB>zh_text` lines into {id: zh_text}."""
+    patches = {}
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "\t" in line:
+                idx_s, text = line.split("\t", 1)
+            else:
+                idx_s, text = line.split(None, 1)
+            patches[int(idx_s)] = text
+    return patches
+
+
+def redub_segments(
+    video_path,
+    ids,
+    texts=None,
+    output_path=None,
+    work_dir="dub_workspace",
+    model_dir="checkpoints",
+    use_fp16=True,
+    tts=None,
+    audio_only_align=True,
+):
+    """Re-TTS selected sentence ids and remux, using checkpoint artifacts.
+
+    ``texts`` is an optional ``{id: new_zh_text}`` map (supports
+    ``<行|HANG2>`` / ``<word|CMU PHONEMES>``). Omitted ids keep existing zh_text.
+    """
+    video_path = str(video_path)
+    video_work_dir, ckpt = _load_work_state(work_dir, video_path)
+    segments = ckpt["segments"]
+    paths = ckpt.get("paths") or {}
+
+    ids = sorted({int(i) for i in ids})
+    for i in ids:
+        if i < 0 or i >= len(segments):
+            raise IndexError(f"segment id {i} out of range 0..{len(segments) - 1}")
+
+    texts = texts or {}
+    tts_dir = os.path.join(video_work_dir, "tts_output")
+    aligned_dir = os.path.join(video_work_dir, "aligned")
+    for i in ids:
+        if i in texts:
+            segments[i]["zh_text"] = texts[i]
+        for folder, prefix in ((tts_dir, "tts"), (aligned_dir, "aligned")):
+            wav = os.path.join(folder, f"{prefix}_{i:04d}.wav")
+            if os.path.isfile(wav):
+                os.remove(wav)
+        segments[i].pop("wav_path", None)
+        segments[i].pop("aligned_path", None)
+
+    vocals_path = paths.get("vocals_path")
+    bg_path = paths.get("bg_path")
+    video_only_path = paths.get("video_only_path")
+    if not vocals_path or not os.path.isfile(vocals_path):
+        raise FileNotFoundError("vocals track missing; cannot pick speaker reference")
+    if not bg_path or not video_only_path:
+        raise FileNotFoundError("cached video/background paths missing from checkpoint")
+
+    speaker_refs = paths.get("speaker_refs") or {}
+    if not speaker_refs:
+        speaker_refs = extract_speaker_refs(segments, vocals_path, video_work_dir)
+        paths["speaker_refs"] = speaker_refs
+    else:
+        for info in speaker_refs.values():
+            if info.get("embedding") is None and os.path.exists(info.get("best_auto", "")):
+                info["embedding"] = _compute_speaker_embedding(info["best_auto"])
+
+    if tts is None:
+        tts = _init_tts(model_dir, use_fp16)
+    else:
+        _reload_tts(tts)
+
+    print(f"\n[redub] Re-synthesizing {len(ids)} segment(s): {ids}")
+    segments = generate_speech(segments, speaker_refs, vocals_path, video_work_dir, tts)
+    _save_checkpoint(video_work_dir, 7, segments=segments, paths=paths)
+
+    print("[redub] Aligning durations...")
+    segments = align_durations(segments, video_work_dir, audio_only_align=audio_only_align)
+    _save_checkpoint(video_work_dir, 8, segments=segments, paths=paths)
+
+    if output_path is None:
+        stem = Path(video_path).stem
+        output_path = str(Path(video_path).parent / f"{stem}_cn.mp4")
+
+    print("[redub] Assembling video...")
+    assemble_final(segments, bg_path, video_only_path, output_path, video_work_dir)
+    _save_checkpoint(video_work_dir, 10, segments=segments, paths=paths)
+
+    srt_base = output_path.rsplit(".", 1)[0]
+    generate_srt(segments, f"{srt_base}.srt", lang="zh")
+    generate_srt(segments, f"{srt_base}_en.srt", lang="en")
+
+    translations_path = os.path.join(video_work_dir, "translations.json")
+    with open(translations_path, "w", encoding="utf-8") as f:
+        json.dump(
+            [{"id": i, "speaker": s.get("speaker"), "start": s["start"], "end": s["end"],
+              "en": s.get("text", ""), "zh": s.get("zh_text", "")}
+             for i, s in enumerate(segments)],
+            f, ensure_ascii=False, indent=2,
+        )
+
+    print(f"\nRedub done! Output: {output_path}")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -2083,8 +2229,52 @@ def main():
         "--whisper-model", default="large-v2",
         help="WhisperX model name (large-v2, large-v3-turbo, distil-large-v3)",
     )
+    parser.add_argument(
+        "--list-segments", action="store_true",
+        help="List checkpoint sentence ids (after a previous dub) and exit",
+    )
+    parser.add_argument(
+        "--redub", default=None,
+        help="Comma-separated sentence ids to re-TTS and remux (e.g. 12,15)",
+    )
+    parser.add_argument(
+        "--redub-text", default=None,
+        help="Replacement zh_text for a single --redub id (supports <行|HANG2>)",
+    )
+    parser.add_argument(
+        "--redub-file", default=None,
+        help="Patch file with lines: id<TAB>zh_text",
+    )
 
     args = parser.parse_args()
+
+    if args.list_segments:
+        list_dub_segments(args.input, work_dir=args.work_dir)
+        return
+
+    if args.redub or args.redub_file:
+        texts = parse_redub_file(args.redub_file) if args.redub_file else {}
+        if args.redub:
+            ids = [int(x) for x in args.redub.split(",") if x.strip() != ""]
+        else:
+            ids = list(texts)
+        if args.redub_text is not None:
+            if len(ids) != 1:
+                print("Error: --redub-text requires exactly one --redub id")
+                sys.exit(1)
+            texts[ids[0]] = args.redub_text
+        use_fp16 = args.fp16 and not args.no_fp16
+        redub_segments(
+            args.input,
+            ids,
+            texts=texts or None,
+            output_path=args.output,
+            work_dir=args.work_dir,
+            model_dir=args.model_dir,
+            use_fp16=use_fp16,
+            audio_only_align=True,
+        )
+        return
 
     hf_token = args.hf_token or os.environ.get("HF_TOKEN")
     llm_api_key = args.llm_api_key or os.environ.get("LLM_API_KEY")
