@@ -52,6 +52,8 @@ def test_dubbing_notebook_uses_drive_work_dir():
     assert 'os.listdir("dub_workspace")' not in text
     assert "list_suspicious_segments" in text
     assert "跳过 Whisper" in text
+    assert "{DRIVE_CACHE}/output/" in text
+    assert "/content/{stem}_cn.mp4" not in text
 
 
 def test_voxcpm_notebook_cache_root_only():

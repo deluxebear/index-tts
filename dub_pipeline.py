@@ -45,6 +45,10 @@ BG_VOLUME = 0.3
 FADE_MS = 10
 SLOWDOWN_COMFORT_LIMIT = 0.75  # min rate for natural-sounding slowdown
 CHECKPOINT_FILE = "checkpoint.json"
+TTS_CHECKPOINT_EVERY = 10
+DURATION_FACTOR_MIN = 0.5
+DURATION_FACTOR_MAX = 2.0
+SKIP_ASR_REF_SECONDS = 8.0
 
 _EN_MONTHS = {
     "january": 1, "jan": 1, "jan.": 1,
@@ -652,6 +656,54 @@ def extract_audio_segment(audio_path, start, end, output_path):
     sf.write(output_path, audio, sr)
 
 
+def find_loudest_window(audio_path, window_sec=SKIP_ASR_REF_SECONDS, ranges=None, hop_sec=0.05):
+    """Return (start, end) of the highest-RMS window, optionally inside ranges."""
+    audio, sr = sf.read(audio_path, dtype="float32")
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+    n = int(len(audio))
+    if n <= 0 or sr <= 0:
+        return 0.0, 0.0
+    duration = n / sr
+    hop = max(1, int(hop_sec * sr))
+    win = max(hop, int(float(window_sec) * sr))
+    if win >= n:
+        return 0.0, duration
+
+    n_hops = max(1, n // hop)
+    energy = np.empty(n_hops, dtype=np.float64)
+    for i in range(n_hops):
+        chunk = audio[i * hop:(i + 1) * hop]
+        energy[i] = float(np.mean(chunk * chunk)) if len(chunk) else 0.0
+
+    def hop_ok(i):
+        if not ranges:
+            return True
+        t = (i + 0.5) * hop / sr
+        return any(a <= t < b for a, b in ranges)
+
+    hops_per_win = max(1, win // hop)
+    csum = np.concatenate([[0.0], np.cumsum(energy)])
+    best_i, best_e = 0, -1.0
+    last = len(energy) - hops_per_win + 1
+    for i in range(max(0, last)):
+        inside = sum(1 for j in range(i, i + hops_per_win) if hop_ok(j))
+        if ranges and inside < hops_per_win * 0.4:
+            continue
+        e = float(csum[i + hops_per_win] - csum[i])
+        if e > best_e:
+            best_e = e
+            best_i = i
+    if best_e < 0:
+        if ranges:
+            a, b = ranges[0]
+            return float(a), float(min(duration, max(b, a + min(window_sec, duration))))
+        return 0.0, min(float(window_sec), duration)
+    start = best_i * hop / sr
+    end = min(duration, start + win / sr)
+    return float(start), float(end)
+
+
 def _compute_speaker_embedding(audio_path):
     """Compute a 192-dim speaker embedding using CAMPPlus.
 
@@ -708,9 +760,19 @@ def extract_speaker_refs(segments, vocals_path, work_dir, fallback_refs=None):
     os.makedirs(refs_dir, exist_ok=True)
 
     for spk, segs in speakers.items():
-        best_seg = max(segs, key=lambda s: s["end"] - s["start"])
+        ranges = [(s["start"], s["end"]) for s in segs if s.get("end", 0) > s.get("start", 0)]
+        try:
+            start, end = find_loudest_window(
+                vocals_path, window_sec=SKIP_ASR_REF_SECONDS, ranges=ranges or None,
+            )
+        except Exception:
+            best_seg = max(segs, key=lambda s: s["end"] - s["start"])
+            start, end = best_seg["start"], best_seg["end"]
+        if end - start < 0.3:
+            best_seg = max(segs, key=lambda s: s["end"] - s["start"])
+            start, end = best_seg["start"], best_seg["end"]
         ref_path = os.path.join(refs_dir, f"ref_{spk}.wav")
-        extract_audio_segment(vocals_path, best_seg["start"], best_seg["end"], ref_path)
+        extract_audio_segment(vocals_path, start, end, ref_path)
 
         if fallback_refs and spk in fallback_refs:
             fallback = fallback_refs[spk]
@@ -725,8 +787,8 @@ def extract_speaker_refs(segments, vocals_path, work_dir, fallback_refs=None):
             "best_auto": ref_path,
             "embedding": embedding,
         }
-        dur = best_seg["end"] - best_seg["start"]
-        print(f"  {spk}: best ref {dur:.1f}s, fallback={'user-provided' if fallback_refs and spk in fallback_refs else 'auto'}")
+        print(f"  {spk}: ref {start:.1f}-{end:.1f}s ({end - start:.1f}s), "
+              f"fallback={'user-provided' if fallback_refs and spk in fallback_refs else 'auto'}")
 
     return speaker_refs
 
@@ -951,10 +1013,11 @@ def _build_translation_prompt(to_translate, context, keep_original_str, prev_lin
    - 50% / 50 percent → 百分之50
    - €50 → 50欧元；£20 → 20英镑；¥100 / 100 yuan → 100元
 10. 星期一律译成「星期X」：Monday → 星期一；weekend → 周末
+11. 每句末尾用 || 附上 8 维情绪（0-1，happy,angry,sad,afraid,disgusted,melancholic,surprised,calm），总和不超过 0.8
 
 返回格式（每行一句，#号对应原句编号）：
-#{to_translate[0][0]} 翻译结果
-#{to_translate[-1][0]} 翻译结果
+#{to_translate[0][0]} 翻译结果 || 0.1,0,0,0,0,0,0,0.4
+#{to_translate[-1][0]} 翻译结果 || 0,0,0,0,0,0,0,0.4
 ..."""
 
 
@@ -1007,7 +1070,7 @@ def translate_with_context(segments, context, llm_client, batch_size=12,
                 print(f"  Warning: LLM API error (attempt {attempt + 1}/{MAX_TRANSLATION_RETRIES}): {e}")
                 continue
 
-            parsed = _parse_translation_response(response)
+            parsed, emos = _parse_translation_response(response)
 
             still_pending = []
             for idx, seg in pending:
@@ -1015,6 +1078,8 @@ def translate_with_context(segments, context, llm_client, batch_size=12,
                 if zh_text is not None:
                     zh_text = normalize_spoken_datetime(zh_text)
                     seg["zh_text"] = zh_text
+                    if idx in emos:
+                        seg["emo_vector"] = emos[idx]
                     translated.append({"id": idx, "zh_text": zh_text})
                 else:
                     still_pending.append((idx, seg))
@@ -1037,17 +1102,70 @@ def translate_with_context(segments, context, llm_client, batch_size=12,
     return segments
 
 
+def _parse_emo_vector(text):
+    parts = [p.strip() for p in text.replace("，", ",").split(",") if p.strip()]
+    if len(parts) != 8:
+        return None
+    try:
+        vec = [max(0.0, min(1.0, float(p))) for p in parts]
+    except ValueError:
+        return None
+    total = sum(vec)
+    if total > 0.8 and total > 0:
+        vec = [v * 0.8 / total for v in vec]
+    return vec
+
+
+def _split_zh_and_emotion(rest):
+    """Split ``译文 || 0.1,0,...`` into (zh_text, emo_vector_or_None)."""
+    if "||" in rest:
+        left, right = rest.rsplit("||", 1)
+        vec = _parse_emo_vector(right)
+        if vec is not None:
+            return left.strip(), vec
+    return rest.strip(), None
+
+
 def _parse_translation_response(response):
-    """Parse numbered translation lines from LLM response."""
+    """Parse numbered translation lines. Returns (zh_by_id, emo_by_id)."""
     result = {}
+    emos = {}
     for line in response.strip().split("\n"):
         line = line.strip()
         match = re.match(r"#(\d+)\s+(.+)", line)
         if match:
             idx = int(match.group(1))
-            text = match.group(2).strip()
-            result[idx] = text
-    return result
+            zh, emo = _split_zh_and_emotion(match.group(2).strip())
+            if zh:
+                result[idx] = zh
+            if emo is not None:
+                emos[idx] = emo
+    return result, emos
+
+
+def estimate_emotion_from_text(text):
+    """Rule-of-thumb 8-dim vector, or None when the line looks neutral."""
+    if not text:
+        return None
+    vec = [0.0] * 8  # happy angry sad afraid disgusted melancholic surprised calm
+    if re.search(r"[哈嘻乐笑太棒真棒太好]", text) or text.count("！") >= 2 or text.count("!") >= 2:
+        vec[0] = 0.25
+    if re.search(r"生气|气愤|愤怒|怒骂", text):
+        vec[1] = 0.25
+    if re.search(r"伤心|难过|哭泣|悲伤", text):
+        vec[2] = 0.25
+    if re.search(r"害怕|恐惧|震惊", text) or "？！" in text or "?!" in text:
+        vec[3] = 0.15
+        vec[6] = 0.15
+    if "？" in text or "?" in text:
+        vec[6] = max(vec[6], 0.1)
+    if sum(vec) == 0:
+        return None
+    vec[7] = 0.15
+    total = sum(vec)
+    if total > 0.8:
+        vec = [v * 0.8 / total for v in vec]
+    return vec
 
 
 def translate_segments(segments, llm_client, batch_size=12, skip_translated=False):
@@ -1121,6 +1239,34 @@ _ZH_NOT_SPEAKER = frozenset(
     "什么 什麼 怎么 怎麼 为什么 為什麼 现在 現在 今天 我们 我們 他们 他們 你们 你們 "
     "大家 其实 还有 還有 或者 以及 虽然 雖然 尽管 儘管 除了 关于 關於".split()
 )
+
+
+def peek_speaker_label(raw_text):
+    """Return a speaker/role label from the start of a raw cue, or None."""
+    if not raw_text:
+        return None
+    line = _HTML_TAG_RE.sub("", str(raw_text).replace("&nbsp;", " "))
+    line = re.split(r"[\n\\N]+", line.strip())[0].strip()
+    if not line:
+        return None
+    m = _SPEAKER_FULL_RE.match(line)
+    if m:
+        return m.group(1).strip() or None
+    m = _SPEAKER_GENERIC_BARE_RE.match(line)
+    if m:
+        return line[: m.end()].rstrip("：: ").strip() or None
+    m = _SPEAKER_EN_NAME_RE.match(line)
+    if m:
+        return line[: m.end()].lstrip("> ").rstrip("：: ").strip() or None
+    m = _SPEAKER_ROLE_RE.match(line)
+    if m:
+        return line[: m.end()].rstrip("：: ").strip() or None
+    m = _SPEAKER_ZH_NAME_RE.match(line)
+    if m:
+        name = line[: m.end()].rstrip("：: ").strip()
+        if name and name not in _ZH_NOT_SPEAKER:
+            return name
+    return None
 _HTML_TAG_RE = re.compile(r"</?[^>]+>")
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _SOUND_BRACKET_RE = re.compile(r"[\[【（\(]([^)\]】）]*)[\]】）\)]")
@@ -1507,6 +1653,8 @@ def load_cleaned_subtitle_cues(video_path, external_subs=None, quiet=False):
             print(f"  Warning: subtitle file is empty: {sub_path}")
         return [], sub_path, lang_hint
 
+    for cue in cues:
+        cue["speaker_label"] = peek_speaker_label(cue.get("text", ""))
     cues = clean_subtitle_cues(cues)
     if not cues:
         if not quiet:
@@ -1520,8 +1668,8 @@ def load_cleaned_subtitle_cues(video_path, external_subs=None, quiet=False):
 
 
 def should_skip_asr(num_speakers, video_path, no_external_subs=False, external_subs=None):
-    """True when a single-speaker job already has cleaned EN/ZH subtitles."""
-    if num_speakers != 1 or no_external_subs:
+    """True when cleaned EN/ZH subtitles exist (any speaker count)."""
+    if no_external_subs:
         return False
     cues, _, _ = load_cleaned_subtitle_cues(
         video_path, external_subs=external_subs, quiet=True,
@@ -1529,24 +1677,140 @@ def should_skip_asr(num_speakers, video_path, no_external_subs=False, external_s
     return bool(cues)
 
 
-SKIP_ASR_REF_SECONDS = 8.0
-
-
 def dummy_single_speaker_segments(vocals_path, clip_sec=SKIP_ASR_REF_SECONDS):
-    """Placeholder ASR row so speaker-ref extraction can clip a short vocal."""
+    """Placeholder ASR row from the loudest vocal window."""
     try:
-        dur = get_audio_duration(vocals_path)
+        start, end = find_loudest_window(vocals_path, window_sec=clip_sec)
     except Exception:
-        dur = clip_sec
-    end = min(float(clip_sec), float(dur)) if dur and dur > 0 else float(clip_sec)
-    if end <= 0:
-        end = 0.5
+        start, end = 0.0, float(clip_sec)
+    if end - start < 0.3:
+        start, end = 0.0, max(float(clip_sec), 0.5)
     return [{
-        "start": 0.0,
+        "start": start,
         "end": end,
         "text": "",
         "speaker": "SPEAKER_00",
     }]
+
+
+def diarize_only(vocals_path, hf_token, num_speakers=None):
+    """Speaker turns from pyannote only — no Whisper transcription."""
+    from whisperx.diarize import DiarizationPipeline
+
+    device = _detect_device()
+    model = DiarizationPipeline(token=hf_token, device=device)
+    kwargs = {}
+    if num_speakers is not None:
+        kwargs["min_speakers"] = max(1, num_speakers - 1)
+        kwargs["max_speakers"] = num_speakers + 1
+    raw = model(vocals_path, **kwargs)
+    del model
+    turns = []
+    if hasattr(raw, "iterrows"):
+        for _, row in raw.iterrows():
+            turns.append({
+                "start": float(row["start"]),
+                "end": float(row["end"]),
+                "speaker": str(row.get("speaker", "SPEAKER_00")),
+            })
+    elif hasattr(raw, "itertracks"):
+        for turn, _, speaker in raw.itertracks(yield_label=True):
+            turns.append({
+                "start": float(turn.start),
+                "end": float(turn.end),
+                "speaker": str(speaker),
+            })
+    print(f"  Diarization-only: {len(turns)} turns, "
+          f"{len({t['speaker'] for t in turns})} speakers")
+    return turns
+
+
+def _speaker_from_turns(cue, turns):
+    best, best_ov = None, 0.0
+    for turn in turns:
+        ov = min(cue["end"], turn["end"]) - max(cue["start"], turn["start"])
+        if ov > best_ov:
+            best_ov = ov
+            best = turn["speaker"]
+    return best
+
+
+def assign_speakers_to_cues(cues, vocals_path=None, num_speakers=None, hf_token=None):
+    """Attach SPEAKER_XX using subtitle labels, else diarization, else SPEAKER_00."""
+    labels = [c.get("speaker_label") for c in cues]
+    labeled = [x for x in labels if x]
+    unique = []
+    for name in labeled:
+        if name not in unique:
+            unique.append(name)
+
+    enough = len(labeled) >= max(1, int(len(cues) * 0.3)) if cues else False
+    if enough and unique:
+        mapping = {name: f"SPEAKER_{i:02d}" for i, name in enumerate(unique)}
+        default = mapping[unique[0]]
+        for cue in cues:
+            cue["speaker"] = mapping.get(cue.get("speaker_label"), default)
+        print(f"  Speakers from subtitle labels: {mapping}")
+        return cues
+
+    if num_speakers == 1 or not hf_token:
+        for cue in cues:
+            cue["speaker"] = "SPEAKER_00"
+        if num_speakers != 1 and not hf_token:
+            print("  Warning: no speaker labels and no HF token; all cues SPEAKER_00")
+        return cues
+
+    turns = diarize_only(vocals_path, hf_token, num_speakers)
+    for cue in cues:
+        cue["speaker"] = _speaker_from_turns(cue, turns) or "SPEAKER_00"
+    return cues
+
+
+def cues_to_segments(cues, lang_hint):
+    """Turn cleaned cues into pipeline segments."""
+    is_english = lang_hint == "en"
+    segments = []
+    for cue in sorted(cues, key=lambda c: c["start"]):
+        speaker = cue.get("speaker") or "SPEAKER_00"
+        if is_english:
+            segments.append({
+                "start": cue["start"],
+                "end": cue["end"],
+                "text": cue["text"],
+                "speaker": speaker,
+            })
+        else:
+            segments.append({
+                "start": cue["start"],
+                "end": cue["end"],
+                "text": "",
+                "zh_text": cue["text"],
+                "speaker": speaker,
+            })
+    return segments
+
+
+def build_segments_from_subtitles(
+    video_path, vocals_path, num_speakers=None, hf_token=None, external_subs=None,
+):
+    """Build synthesis units from cleaned subtitles without Whisper."""
+    cues, sub_path, lang_hint = load_cleaned_subtitle_cues(
+        video_path, external_subs=external_subs,
+    )
+    if not cues or not sub_path:
+        return None, None
+    source_desc = lang_hint
+    if lang_hint == "zht":
+        print("  Converting Traditional Chinese → Simplified Chinese...")
+        cues = convert_traditional_to_simplified(cues)
+        source_desc = "zht→zh"
+    cues = assign_speakers_to_cues(
+        cues, vocals_path=vocals_path, num_speakers=num_speakers, hf_token=hf_token,
+    )
+    text_lang = "en" if lang_hint == "en" else "zh"
+    segments = cues_to_segments(cues, text_lang)
+    print(f"  Subtitle-driven ({text_lang}): {len(segments)} cues, Whisper skipped")
+    return segments, f"{source_desc}:{Path(sub_path).name}"
 
 
 def load_external_subtitles(video_path, segments):
@@ -1784,13 +2048,29 @@ def get_audio_duration(path):
     return info.duration
 
 
-def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
+def tts_duration_factor(zh_text, target_sec):
+    """Map target slot vs natural length onto IndexTTS-2.5 duration_factor."""
+    n = len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", zh_text or ""))
+    if n < 1 or target_sec <= 0:
+        return 1.0
+    natural = n / CHARS_PER_SECOND
+    if natural <= 0:
+        return 1.0
+    factor = target_sec / natural
+    return max(DURATION_FACTOR_MIN, min(DURATION_FACTOR_MAX, factor))
+
+
+def generate_speech(
+    segments, speaker_refs, vocals_path, work_dir, tts,
+    checkpoint_cb=None, checkpoint_every=TTS_CHECKPOINT_EVERY,
+):
     """Generate Chinese speech for each segment using IndexTTS2."""
     tts_dir = os.path.join(work_dir, "tts_output")
     seg_ref_dir = os.path.join(work_dir, "seg_refs")
     os.makedirs(tts_dir, exist_ok=True)
     os.makedirs(seg_ref_dir, exist_ok=True)
     glossary = load_pronunciation_glossary(work_dir=work_dir)
+    synthesized = 0
 
     for i, seg in enumerate(segments):
         zh_text = normalize_spoken_datetime(seg.get("zh_text", "") or "")
@@ -1802,6 +2082,7 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
             continue
 
         output_path = os.path.join(tts_dir, f"tts_{i:04d}.wav")
+        target_dur = seg["end"] - seg["start"]
 
         # Skip if already generated (for resume)
         if os.path.exists(output_path):
@@ -1810,23 +2091,32 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
         else:
             ref_audio = get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir)
             tts_text = annotate_tts_text(zh_text, glossary=glossary)
-            tts.infer(
+            emo = seg.get("emo_vector") or estimate_emotion_from_text(zh_text)
+            infer_kwargs = dict(
                 spk_audio_prompt=ref_audio,
                 text=tts_text,
                 output_path=output_path,
                 lang="zh",
                 emo_audio_prompt=ref_audio,
+                duration_factor=tts_duration_factor(zh_text, target_dur),
                 verbose=False,
             )
+            if emo:
+                infer_kwargs["emo_vector"] = emo
+            tts.infer(**infer_kwargs)
             seg["wav_path"] = output_path
             seg["actual_duration"] = get_audio_duration(output_path)
+            synthesized += 1
+            if checkpoint_cb and checkpoint_every and synthesized % checkpoint_every == 0:
+                checkpoint_cb(segments)
 
-        target_dur = seg["end"] - seg["start"]
         ratio = seg["actual_duration"] / target_dur if target_dur > 0 else 1.0
         print(f"  [{i:3d}] {seg.get('speaker', '?')} | "
               f"target={target_dur:.1f}s actual={seg['actual_duration']:.1f}s "
               f"ratio={ratio:.2f} | {zh_text[:30]}...")
 
+    if checkpoint_cb and synthesized:
+        checkpoint_cb(segments)
     return segments
 
 
@@ -2570,9 +2860,21 @@ def dub_video(
             no_external_subs=no_external_subs, external_subs=external_subs,
         )
         if skip_asr:
-            print("\n[Step 3/11] Skipping Whisper (single speaker + cleaned subtitles)...")
-            segments = dummy_single_speaker_segments(vocals_path)
-            paths["skipped_asr"] = True
+            print("\n[Step 3/11] Skipping Whisper (cleaned subtitles)...")
+            segments, sub_source = build_segments_from_subtitles(
+                video_path, vocals_path,
+                num_speakers=num_speakers, hf_token=hf_token,
+                external_subs=external_subs,
+            )
+            if segments:
+                paths["skipped_asr"] = True
+                paths["subtitle_driven"] = True
+                paths["subtitle_source"] = sub_source
+            else:
+                print("  Subtitle path empty, falling back to Whisper")
+                segments = transcribe_and_diarize(
+                    vocals_path, hf_token, num_speakers, whisper_model=whisper_model,
+                )
         else:
             print("\n[Step 3/11] Transcribing and diarizing...")
             segments = transcribe_and_diarize(
@@ -2615,8 +2917,10 @@ def dub_video(
         # Subtitle-driven mode: when a complete external subtitle is provided,
         # use each cue directly as a synthesis unit (cue timing + text + speaker
         # from ASR overlap) instead of grafting cue text onto ASR segments.
-        sub_source = None
-        if not no_external_subs:
+        sub_source = paths.get("subtitle_source") if paths.get("subtitle_driven") else None
+        if paths.get("subtitle_driven") and segments:
+            print(f"  Using subtitle-driven segments from step 3 ({sub_source})")
+        elif not no_external_subs:
             sub_segments, sub_source = build_subtitle_driven_segments(
                 video_path, segments, external_subs=external_subs
             )
@@ -2662,7 +2966,14 @@ def dub_video(
         _reload_tts(tts)
         if tts is None:
             tts = _init_tts(model_dir, use_fp16)
-        segments = generate_speech(segments, speaker_refs, vocals_path, video_work_dir, tts)
+
+        def _tts_ckpt(segs):
+            _save_checkpoint(video_work_dir, 6, segments=segs, paths=paths)
+
+        segments = generate_speech(
+            segments, speaker_refs, vocals_path, video_work_dir, tts,
+            checkpoint_cb=_tts_ckpt,
+        )
         _save_checkpoint(video_work_dir, 7, segments=segments, paths=paths)
     else:
         print(f"\n[Step 6/11] Skipped (cached)")
@@ -2711,11 +3022,15 @@ def dub_video(
     generate_srt(segments, f"{srt_base}.srt", lang="zh")
     generate_srt(segments, f"{srt_base}_en.srt", lang="en")
 
-    # Mark done
-    _clear_checkpoint(video_work_dir)
+    # Keep a finished checkpoint so list/redub still work after success.
+    _save_checkpoint(
+        video_work_dir, 10, segments=segments, paths=paths,
+        timeline=timeline, new_total=new_total,
+    )
 
     # Cleanup if requested
     if cleanup:
+        _clear_checkpoint(video_work_dir)
         import shutil
         shutil.rmtree(video_work_dir)
         print(f"  Cleaned up: {video_work_dir}")
