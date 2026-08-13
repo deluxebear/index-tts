@@ -129,3 +129,21 @@ def test_port_busy_with_foreign_process():
         "tools.colab.is_webui_healthy", return_value=False
     ):
         assert port_busy_with_foreign_process(7860) is True
+
+
+from tools.colab import ready_card_html
+
+
+def test_ready_card_html_contains_url_and_kind():
+    html = ready_card_html("https://abc.trycloudflare.com", kind="cloudflare")
+    assert "https://abc.trycloudflare.com" in html
+    assert "IndexTTS WebUI is ready" in html
+    assert "Cloudflare" in html
+    assert "<iframe" not in html.lower()
+
+
+def test_ready_card_html_gradio_and_local_notes():
+    g = ready_card_html("https://x.gradio.live", kind="gradio")
+    assert "Gradio" in g
+    loc = ready_card_html("http://127.0.0.1:7860", kind="local")
+    assert "Local" in loc
