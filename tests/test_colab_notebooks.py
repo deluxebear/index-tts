@@ -29,6 +29,7 @@ def test_main_notebook_is_webui_path():
     assert "os.makedirs(LOCAL_FALLBACK" not in text
     assert 'raise SystemExit("pip install failed")' in text
     assert "_exit_code" in text
+    assert "torchvision" in text
 
 
 def test_pipeline_notebooks_share_cache_and_v25():
