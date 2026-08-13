@@ -217,15 +217,20 @@ def _reload_tts(tts):
             model.to(device)
 
 
-def transcribe_and_diarize(vocals_path, hf_token, num_speakers=None):
-    """Transcribe with word-level timestamps and speaker labels."""
+def transcribe_and_diarize(
+    vocals_path, hf_token, num_speakers=None, whisper_model="large-v2",
+):
+    """Transcribe with word-level timestamps and speaker labels.
+
+    ``num_speakers=1`` skips pyannote and labels every segment SPEAKER_00.
+    """
     import whisperx
 
     device = _detect_device()
     compute_type = "float16" if device == "cuda" else "int8"
 
-    print("  Loading Whisper model...")
-    model = whisperx.load_model("large-v2", device, compute_type=compute_type)
+    print(f"  Loading Whisper model ({whisper_model})...")
+    model = whisperx.load_model(whisper_model, device, compute_type=compute_type)
     result = model.transcribe(vocals_path, batch_size=16)
     del model
 
@@ -237,6 +242,17 @@ def transcribe_and_diarize(vocals_path, hf_token, num_speakers=None):
         result["segments"], align_model, metadata, vocals_path, device
     )
     del align_model
+
+    if num_speakers == 1:
+        print("  Skipping speaker diarization (num_speakers=1)")
+        segments = result["segments"]
+        for seg in segments:
+            seg["speaker"] = "SPEAKER_00"
+        print(f"  Transcribed {len(segments)} segments, 1 speaker")
+        return segments
+
+    if not hf_token:
+        raise ValueError("hf_token is required for speaker diarization (num_speakers != 1)")
 
     print("  Running speaker diarization...")
     from whisperx.diarize import DiarizationPipeline
@@ -1674,6 +1690,7 @@ def dub_video(
     external_subs=None,
     no_external_subs=False,
     audio_only_align=False,
+    whisper_model="large-v2",
 ):
     """
     Main pipeline: dub an English video into Chinese.
@@ -1696,6 +1713,7 @@ def dub_video(
         no_external_subs: Disable auto-discovery of external subtitles.
         audio_only_align: Audio absorbs all time difference (no video slowdown).
             Much faster assembly (uses -c:v copy), but speech may be faster.
+        whisper_model: WhisperX model id (e.g. large-v2, large-v3-turbo).
     """
     video_path = str(video_path)
     if output_path is None:
@@ -1746,7 +1764,9 @@ def dub_video(
     # --- Step 3: ASR + diarization ---
     if done < 3:
         print("\n[Step 3/11] Transcribing and diarizing...")
-        segments = transcribe_and_diarize(vocals_path, hf_token, num_speakers)
+        segments = transcribe_and_diarize(
+            vocals_path, hf_token, num_speakers, whisper_model=whisper_model,
+        )
         transcript_path = os.path.join(video_work_dir, "transcript.json")
         with open(transcript_path, "w", encoding="utf-8") as f:
             json.dump(segments, f, ensure_ascii=False, indent=2)
@@ -1997,6 +2017,10 @@ def main():
     parser.add_argument("--no-external-subs", action="store_true", help="Disable auto-discovery of external subtitles")
     parser.add_argument("--audio-only-align", action="store_true",
                         help="Audio absorbs all time difference (no video slowdown/re-encoding, much faster)")
+    parser.add_argument(
+        "--whisper-model", default="large-v2",
+        help="WhisperX model name (large-v2, large-v3-turbo, distil-large-v3)",
+    )
 
     args = parser.parse_args()
 
@@ -2004,8 +2028,9 @@ def main():
     llm_api_key = args.llm_api_key or os.environ.get("LLM_API_KEY")
     use_fp16 = args.fp16 and not args.no_fp16
 
-    if not hf_token:
-        print("Error: HuggingFace token required. Use --hf-token or set HF_TOKEN env var.")
+    needs_diarization = args.num_speakers is None or args.num_speakers != 1
+    if needs_diarization and not hf_token:
+        print("Error: HuggingFace token required for diarization. Use --hf-token or set HF_TOKEN, or pass --num-speakers 1.")
         sys.exit(1)
     if not llm_api_key:
         print("Error: LLM API key required. Use --llm-api-key or set LLM_API_KEY env var.")
@@ -2024,6 +2049,7 @@ def main():
         external_subs=args.external_subs,
         no_external_subs=args.no_external_subs,
         audio_only_align=args.audio_only_align,
+        whisper_model=args.whisper_model,
     )
 
     if args.batch:
