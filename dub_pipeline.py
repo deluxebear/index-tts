@@ -46,6 +46,96 @@ FADE_MS = 10
 SLOWDOWN_COMFORT_LIMIT = 0.75  # min rate for natural-sounding slowdown
 CHECKPOINT_FILE = "checkpoint.json"
 
+_EN_MONTHS = {
+    "january": 1, "jan": 1, "jan.": 1,
+    "february": 2, "feb": 2, "feb.": 2,
+    "march": 3, "mar": 3, "mar.": 3,
+    "april": 4, "apr": 4, "apr.": 4,
+    "may": 5,
+    "june": 6, "jun": 6, "jun.": 6,
+    "july": 7, "jul": 7, "jul.": 7,
+    "august": 8, "aug": 8, "aug.": 8,
+    "september": 9, "sep": 9, "sept": 9, "sep.": 9, "sept.": 9,
+    "october": 10, "oct": 10, "oct.": 10,
+    "november": 11, "nov": 11, "nov.": 11,
+    "december": 12, "dec": 12, "dec.": 12,
+}
+_MONTH_ALT = "|".join(
+    re.escape(k) for k in sorted(_EN_MONTHS, key=len, reverse=True)
+)
+_ORDINAL = r"(?:st|nd|rd|th)?"
+
+
+def _zh_date(year=None, month=None, day=None):
+    parts = []
+    if year:
+        parts.append(f"{int(year)}年")
+    if month:
+        parts.append(f"{int(month)}月")
+    if day:
+        parts.append(f"{int(day)}日")
+    return "".join(parts)
+
+
+def normalize_spoken_dates(text):
+    """Rewrite leftover English / numeric dates into spoken Chinese (年/月/日).
+
+    Idempotent on already-normalized strings such as ``2024年1月15日``.
+    """
+    if not text:
+        return text
+
+    def month_num(name):
+        return _EN_MONTHS[name.lower().rstrip(".")]
+
+    def repl_mdy(m):
+        return _zh_date(m.group(3), month_num(m.group(1)), m.group(2))
+
+    def repl_dmy(m):
+        return _zh_date(m.group(3), month_num(m.group(2)), m.group(1))
+
+    def repl_the_of(m):
+        return _zh_date(month=month_num(m.group(2)), day=m.group(1))
+
+    def repl_md(m):
+        return _zh_date(month=month_num(m.group(1)), day=m.group(2))
+
+    def repl_my(m):
+        return _zh_date(m.group(2), month_num(m.group(1)))
+
+    def repl_iso(m):
+        return _zh_date(m.group(1), m.group(2), m.group(3))
+
+    def repl_num(m):
+        a, b, y = int(m.group(1)), int(m.group(2)), m.group(3)
+        if a > 12:
+            return _zh_date(y, b, a)
+        return _zh_date(y, a, b)
+
+    text = re.sub(
+        rf"(?i)\b({_MONTH_ALT})\s+(\d{{1,2}}){_ORDINAL},?\s+(\d{{4}})\b",
+        repl_mdy, text,
+    )
+    text = re.sub(
+        rf"(?i)\b(\d{{1,2}}){_ORDINAL}\s+(?:of\s+)?({_MONTH_ALT}),?\s+(\d{{4}})\b",
+        repl_dmy, text,
+    )
+    text = re.sub(
+        rf"(?i)\bthe\s+(\d{{1,2}}){_ORDINAL}\s+of\s+({_MONTH_ALT})\b",
+        repl_the_of, text,
+    )
+    text = re.sub(
+        rf"(?i)\b({_MONTH_ALT})\s+(\d{{4}})\b",
+        repl_my, text,
+    )
+    text = re.sub(
+        rf"(?i)\b({_MONTH_ALT})\s+(\d{{1,2}}){_ORDINAL}\b",
+        repl_md, text,
+    )
+    text = re.sub(r"\b(20\d{2}|19\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", repl_iso, text)
+    text = re.sub(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2}|19\d{2})\b", repl_num, text)
+    return text
+
 
 def _run_ffmpeg(*args):
     """Run an ffmpeg command, raising with stderr on failure."""
@@ -588,6 +678,12 @@ def _build_translation_prompt(to_translate, context, keep_original_str, prev_lin
 4. 保持原文的语气和情感色彩
 5. 人名/专有名词保持一致
 6. 品牌名、产品名、公司名、技术专有名词保留英文原文，不要翻译（如 ChatGPT 不要译为"聊天GPT"）
+7. 日期一律译成配音口播格式，不要保留英文月份或斜杠数字：
+   - January 15, 2024 / Jan. 15th, 2024 / 15 January 2024 → 2024年1月15日
+   - the 3rd of March / March 3rd → 3月3日
+   - March 2020 → 2020年3月
+   - 2024-01-15、01/15/2024 → 2024年1月15日
+   - 不要写成 January、1/15、15th
 
 返回格式（每行一句，#号对应原句编号）：
 #{to_translate[0][0]} 翻译结果
@@ -650,6 +746,7 @@ def translate_with_context(segments, context, llm_client, batch_size=12,
             for idx, seg in pending:
                 zh_text = parsed.get(idx)
                 if zh_text is not None:
+                    zh_text = normalize_spoken_dates(zh_text)
                     seg["zh_text"] = zh_text
                     translated.append({"id": idx, "zh_text": zh_text})
                 else:
@@ -1279,7 +1376,9 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
     os.makedirs(seg_ref_dir, exist_ok=True)
 
     for i, seg in enumerate(segments):
-        zh_text = seg.get("zh_text", "")
+        zh_text = normalize_spoken_dates(seg.get("zh_text", "") or "")
+        if zh_text:
+            seg["zh_text"] = zh_text
         if not zh_text.strip():
             seg["wav_path"] = None
             seg["actual_duration"] = 0
