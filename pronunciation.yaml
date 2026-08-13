@@ -1,0 +1,15 @@
+# IndexTTS-2.5 pronunciation tags applied to zh_text right before TTS.
+# Chinese: <字|PINYIN_TONE>   (see checkpoints/pinyin.vocab)
+# English: <word|CMU PHONEMES>
+# Put a copy in WORK_DIR/pronunciation.yaml to override these defaults.
+
+银行: 银<行|HANG2>
+ChatGPT: <ChatGPT|CH AE1 T JH IY1 P IY1 T IY1>
+GPT: <GPT|JH IY1 P IY1 T IY1>
+OpenAI: <OpenAI|OW1 P AH0 N EY1>
+GPU: <GPU|JH IY1 P IY1 Y UW1>
+CPU: <CPU|S IY1 P IY1 Y UW1>
+TED: <TED|T EH1 D>
+YouTube: <YouTube|Y UW1 T UW1 B>
+iPhone: <iPhone|AY1 F OW1 N>
+API: <API|EY1 P IY1 AY1>

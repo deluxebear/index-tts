@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-CHARS_PER_SECOND = 4.5
+CHARS_PER_SECOND = 3.8
 AUDIO_COMFORT_LIMIT = 1.2
 VIDEO_SLOWDOWN_MAX = 2.0
 MIN_REF_DURATION = 3.0
@@ -255,9 +255,138 @@ def normalize_spoken_times(text):
     return text
 
 
+_NUM = r"(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)"
+_MILLION = r"(?:million|mm?)"
+_BILLION = r"(?:billion|bn?)"
+
+
+def _parse_spoken_num(token):
+    return float(token.replace(",", ""))
+
+
+def _fmt_spoken_num(n):
+    if abs(n - round(n)) < 1e-6:
+        return str(int(round(n)))
+    return f"{n:.4f}".rstrip("0").rstrip(".")
+
+
+def _scale_wan_yi(n, scale):
+    if scale == "million":
+        return _fmt_spoken_num(n * 100) + "万"
+    return _fmt_spoken_num(n * 10) + "亿"
+
+
+def _scale_name(token):
+    t = token.lower().rstrip(".")
+    if t.startswith("b") or t == "bn":
+        return "billion"
+    return "million"
+
+
+def normalize_spoken_numbers(text):
+    """Rewrite leftover money / scale / percent into spoken Chinese.
+
+    Idempotent on already-normalized strings such as ``100美元`` / ``百分之50``.
+    """
+    if not text:
+        return text
+
+    def repl_cur_scale(m):
+        return _scale_wan_yi(_parse_spoken_num(m.group(1)), _scale_name(m.group(2))) + "美元"
+
+    def repl_scale_dollars(m):
+        return _scale_wan_yi(_parse_spoken_num(m.group(1)), _scale_name(m.group(2))) + "美元"
+
+    def repl_scale(m):
+        return _scale_wan_yi(_parse_spoken_num(m.group(1)), _scale_name(m.group(2)))
+
+    def repl_usd(m):
+        return _fmt_spoken_num(_parse_spoken_num(m.group(1))) + "美元"
+
+    def repl_eur(m):
+        return _fmt_spoken_num(_parse_spoken_num(m.group(1))) + "欧元"
+
+    def repl_gbp(m):
+        return _fmt_spoken_num(_parse_spoken_num(m.group(1))) + "英镑"
+
+    def repl_cny(m):
+        return _fmt_spoken_num(_parse_spoken_num(m.group(1))) + "元"
+
+    def repl_pct(m):
+        return "百分之" + _fmt_spoken_num(_parse_spoken_num(m.group(1)))
+
+    def repl_comma(m):
+        return m.group(1).replace(",", "")
+
+    # $1.5 million / USD 1.5m
+    text = re.sub(
+        rf"(?i)(?:us\$|usd\s*|\$)\s*{_NUM}\s*({_MILLION}|{_BILLION})\b",
+        repl_cur_scale, text,
+    )
+    # 1.5 million dollars / 1 billion USD
+    text = re.sub(
+        rf"(?i){_NUM}\s*({_MILLION}|{_BILLION})\s*(?:us\s*)?(?:dollars?|usd)\b",
+        repl_scale_dollars, text,
+    )
+    # 1.5 million / 2 billion (no currency)
+    text = re.sub(
+        rf"(?i){_NUM}\s*({_MILLION}|{_BILLION})\b",
+        repl_scale, text,
+    )
+    text = re.sub(rf"(?i)(?:us\$|usd\s*|\$)\s*{_NUM}", repl_usd, text)
+    text = re.sub(rf"(?i){_NUM}\s*(?:us\s*)?(?:dollars?|usd)\b", repl_usd, text)
+    text = re.sub(rf"(?i)(?:€|eur\s*)\s*{_NUM}", repl_eur, text)
+    text = re.sub(rf"(?i){_NUM}\s*(?:euros?|eur)\b", repl_eur, text)
+    text = re.sub(rf"(?i)(?:£|gbp\s*)\s*{_NUM}", repl_gbp, text)
+    text = re.sub(rf"(?i){_NUM}\s*(?:pounds?|gbp)\b", repl_gbp, text)
+    text = re.sub(rf"(?i)(?:¥|￥|rmb\s*|cny\s*)\s*{_NUM}", repl_cny, text)
+    text = re.sub(rf"(?i){_NUM}\s*(?:yuan|rmb|cny)\b", repl_cny, text)
+    text = re.sub(rf"(?i)(?<!百分之){_NUM}\s*(?:%|percent\b|per\s*cent\b)", repl_pct, text)
+    text = re.sub(r"\b(\d{1,3}(?:,\d{3})+)\b", repl_comma, text)
+    return text
+
+
+_EN_WEEKDAYS = {
+    "monday": "星期一", "mon": "星期一",
+    "tuesday": "星期二", "tue": "星期二", "tues": "星期二",
+    "wednesday": "星期三", "wed": "星期三",
+    "thursday": "星期四", "thu": "星期四", "thur": "星期四", "thurs": "星期四",
+    "friday": "星期五", "fri": "星期五",
+    "saturday": "星期六", "sat": "星期六",
+    "sunday": "星期日", "sun": "星期日",
+}
+_WEEKDAY_FULL_ALT = "|".join(
+    sorted((k for k in _EN_WEEKDAYS if len(k) > 3), key=len, reverse=True)
+)
+_WEEKDAY_ABBR_ALT = "|".join(
+    sorted((k for k in _EN_WEEKDAYS if len(k) <= 3), key=len, reverse=True)
+)
+
+
+def normalize_spoken_weekdays(text):
+    """Rewrite leftover English weekdays into 星期X. Bare ``Sun`` is left alone."""
+    if not text:
+        return text
+
+    def repl_full(m):
+        return _EN_WEEKDAYS[m.group(1).lower()]
+
+    def repl_abbr(m):
+        return _EN_WEEKDAYS[m.group(1).lower().rstrip(".")]
+
+    text = re.sub(rf"(?i)\b({_WEEKDAY_FULL_ALT})\b", repl_full, text)
+    text = re.sub(rf"(?i)\b({_WEEKDAY_ABBR_ALT})\.", repl_abbr, text)
+    text = re.sub(r"(?i)\bweekends?\b", "周末", text)
+    return text
+
+
 def normalize_spoken_datetime(text):
-    """Normalize leftover English dates then clock times for TTS."""
-    return normalize_spoken_times(normalize_spoken_dates(text))
+    """Normalize leftover English dates, times, numbers, and weekdays for TTS."""
+    text = normalize_spoken_dates(text)
+    text = normalize_spoken_times(text)
+    text = normalize_spoken_numbers(text)
+    text = normalize_spoken_weekdays(text)
+    return text
 
 
 def _run_ffmpeg(*args):
@@ -815,6 +944,13 @@ def _build_translation_prompt(to_translate, context, keep_original_str, prev_lin
    - 3 o'clock → 3点
    - quarter to 5 → 4点45分
    - 不要写成 3:00、3PM、15:00
+9. 数字、金额、百分比译成配音口播格式：
+   - $100 / 100 dollars / USD 100 → 100美元
+   - $1.5 million / 1.5 million dollars → 150万美元
+   - 1 million → 100万；1 billion → 10亿
+   - 50% / 50 percent → 百分之50
+   - €50 → 50欧元；£20 → 20英镑；¥100 / 100 yuan → 100元
+10. 星期一律译成「星期X」：Monday → 星期一；weekend → 周末
 
 返回格式（每行一句，#号对应原句编号）：
 #{to_translate[0][0]} 翻译结果
@@ -889,12 +1025,11 @@ def translate_with_context(segments, context, llm_client, batch_size=12,
                 print(f"  Retrying {len(pending)} missing segments {missing_ids} "
                       f"(attempt {attempt + 2}/{MAX_TRANSLATION_RETRIES})...")
 
-        # Fall back to original text for segments that failed all retries
+        # Do not fall back to English — leftover source would be spoken as Chinese.
         for idx, seg in pending:
             print(f"  Warning: segment #{idx} translation failed after "
-                  f"{MAX_TRANSLATION_RETRIES} attempts, using original text")
-            seg["zh_text"] = seg["text"]
-            translated.append({"id": idx, "zh_text": seg["text"]})
+                  f"{MAX_TRANSLATION_RETRIES} attempts; leaving zh_text empty")
+            seg.pop("zh_text", None)
 
         translated_ids = [idx for idx, _ in need_translation]
         print(f"  Translated segments {translated_ids[0]}-{translated_ids[-1]}")
@@ -929,6 +1064,14 @@ def translate_segments(segments, llm_client, batch_size=12, skip_translated=Fals
     segments = translate_with_context(segments, context, llm_client, batch_size,
                                       skip_translated=skip_translated)
     return segments, context
+
+
+def untranslated_segment_ids(segments):
+    """Ids that have source text but no Chinese translation."""
+    return [
+        i for i, seg in enumerate(segments)
+        if (seg.get("text") or "").strip() and not (seg.get("zh_text") or "").strip()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1216,7 +1359,7 @@ def convert_traditional_to_simplified(cues):
     return cues
 
 
-def discover_subtitle(video_path):
+def discover_subtitle(video_path, quiet=False):
     """Find the best matching subtitle file for a video.
 
     Globs for {stem}*.srt and {stem}*.ass, extracts language code from filename
@@ -1275,7 +1418,8 @@ def discover_subtitle(video_path):
         sample_text = " ".join(c["text"] for c in cues[:50])
         lang_hint = detect_subtitle_language(sample_text)
 
-    print(f"  Found subtitle: {best_path.name} (detected: {lang_hint})")
+    if not quiet:
+        print(f"  Found subtitle: {best_path.name} (detected: {lang_hint})")
     return str(best_path), lang_hint
 
 
@@ -1344,6 +1488,65 @@ def match_srt_to_segments(cues, segments):
             matched += 1
 
     return segments, matched
+
+
+def load_cleaned_subtitle_cues(video_path, external_subs=None, quiet=False):
+    """Discover, parse, and clean subtitle cues.
+
+    Returns ``(cues, sub_path, lang_hint)``. ``cues`` is empty when nothing usable
+    is found; ``sub_path`` / ``lang_hint`` may still be set for an empty file.
+    """
+    sub_path, lang_hint = discover_subtitle(external_subs or video_path, quiet=quiet)
+    if sub_path is None:
+        return [], None, None
+
+    parser = parse_ass if sub_path.endswith(".ass") else parse_srt
+    cues = parser(sub_path)
+    if not cues:
+        if not quiet:
+            print(f"  Warning: subtitle file is empty: {sub_path}")
+        return [], sub_path, lang_hint
+
+    cues = clean_subtitle_cues(cues)
+    if not cues:
+        if not quiet:
+            print("  Warning: all subtitle cues were non-dialogue, skipping")
+        return [], sub_path, lang_hint
+
+    if lang_hint == "unknown":
+        sample = " ".join(c["text"] for c in cues[:50])
+        lang_hint = detect_subtitle_language(sample)
+    return cues, sub_path, lang_hint
+
+
+def should_skip_asr(num_speakers, video_path, no_external_subs=False, external_subs=None):
+    """True when a single-speaker job already has cleaned EN/ZH subtitles."""
+    if num_speakers != 1 or no_external_subs:
+        return False
+    cues, _, _ = load_cleaned_subtitle_cues(
+        video_path, external_subs=external_subs, quiet=True,
+    )
+    return bool(cues)
+
+
+SKIP_ASR_REF_SECONDS = 8.0
+
+
+def dummy_single_speaker_segments(vocals_path, clip_sec=SKIP_ASR_REF_SECONDS):
+    """Placeholder ASR row so speaker-ref extraction can clip a short vocal."""
+    try:
+        dur = get_audio_duration(vocals_path)
+    except Exception:
+        dur = clip_sec
+    end = min(float(clip_sec), float(dur)) if dur and dur > 0 else float(clip_sec)
+    if end <= 0:
+        end = 0.5
+    return [{
+        "start": 0.0,
+        "end": end,
+        "text": "",
+        "speaker": "SPEAKER_00",
+    }]
 
 
 def load_external_subtitles(video_path, segments):
@@ -1427,24 +1630,11 @@ def build_subtitle_driven_segments(video_path, asr_segments, external_subs=None)
     Returns (segments, source_desc) with zh_text pre-filled on every segment,
     or (None, None) to fall back to the ASR + LLM translation path.
     """
-    sub_path, lang_hint = discover_subtitle(external_subs or video_path)
-    if sub_path is None:
+    cues, sub_path, lang_hint = load_cleaned_subtitle_cues(
+        video_path, external_subs=external_subs,
+    )
+    if not cues or not sub_path:
         return None, None
-
-    parser = parse_ass if sub_path.endswith(".ass") else parse_srt
-    cues = parser(sub_path)
-    if not cues:
-        print(f"  Warning: subtitle file is empty: {sub_path}")
-        return None, None
-
-    cues = clean_subtitle_cues(cues)
-    if not cues:
-        print("  Warning: all subtitle cues were non-dialogue, skipping")
-        return None, None
-
-    if lang_hint == "unknown":
-        sample = " ".join(c["text"] for c in cues[:50])
-        lang_hint = detect_subtitle_language(sample)
 
     source_desc = lang_hint
     is_english = lang_hint == "en"
@@ -1490,6 +1680,101 @@ def build_subtitle_driven_segments(video_path, asr_segments, external_subs=None)
 
 
 # ---------------------------------------------------------------------------
+# Pronunciation glossary (IndexTTS-2.5 <字|PINYIN> / <word|CMU> tags)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PRON_PATH = Path(__file__).resolve().parent / "pronunciation.yaml"
+_PRON_TAG_RE = re.compile(r"<[^<>|]+\|[^<>]+>")
+_EN_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9][A-Za-z0-9.\-]*\b")
+_G2P = None
+_G2P_UNAVAILABLE = False
+
+
+def load_pronunciation_glossary(path=None, work_dir=None):
+    """Load ``term: replacement`` maps from YAML. work_dir overrides the default."""
+    merged = {}
+    if path:
+        candidates = [path]
+    else:
+        candidates = [str(_DEFAULT_PRON_PATH)]
+        if work_dir:
+            candidates.append(os.path.join(work_dir, "pronunciation.yaml"))
+    for candidate in candidates:
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        try:
+            import yaml
+            with open(candidate, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f"  Warning: failed to load pronunciation glossary {candidate}: {e}")
+            continue
+        if not isinstance(data, dict):
+            continue
+        terms = data["terms"] if isinstance(data.get("terms"), dict) else data
+        for key, value in terms.items():
+            if key == "terms" and isinstance(value, dict):
+                continue
+            if key and isinstance(value, str):
+                merged[str(key)] = value
+    return merged
+
+
+def _annotate_english_g2p(text):
+    """Wrap leftover English words in ``<word|CMU PHONEMES>`` via g2p-en."""
+    global _G2P, _G2P_UNAVAILABLE
+    if _G2P_UNAVAILABLE:
+        return text
+    if _G2P is None:
+        try:
+            import nltk
+            nltk.data.find("corpora/cmudict")
+            from g2p_en import G2p
+            _G2P = G2p()
+        except Exception:
+            _G2P_UNAVAILABLE = True
+            return text
+
+    def repl(m):
+        word = m.group(0)
+        try:
+            phones = [p for p in _G2P(word) if p and p.strip() and p != " "]
+        except Exception:
+            return word
+        if not phones:
+            return word
+        return f"<{word}|{' '.join(phones)}>"
+
+    return _EN_WORD_RE.sub(repl, text)
+
+
+def annotate_tts_text(text, glossary=None, use_g2p=True):
+    """Apply pronunciation.yaml then optional g2p-en. Existing tags are kept."""
+    if not text:
+        return text
+    if glossary is None:
+        glossary = load_pronunciation_glossary()
+
+    placeholders = {}
+
+    def protect(m):
+        key = f"\x00P{len(placeholders)}\x00"
+        placeholders[key] = m.group(0)
+        return key
+
+    protected = _PRON_TAG_RE.sub(protect, text)
+    for term in sorted(glossary, key=len, reverse=True):
+        if term and term in protected:
+            protected = protected.replace(term, glossary[term])
+    protected = _PRON_TAG_RE.sub(protect, protected)
+    if use_g2p:
+        protected = _annotate_english_g2p(protected)
+    for key, value in placeholders.items():
+        protected = protected.replace(key, value)
+    return protected
+
+
+# ---------------------------------------------------------------------------
 # Step 6: TTS generation with IndexTTS2
 # ---------------------------------------------------------------------------
 
@@ -1505,6 +1790,7 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
     seg_ref_dir = os.path.join(work_dir, "seg_refs")
     os.makedirs(tts_dir, exist_ok=True)
     os.makedirs(seg_ref_dir, exist_ok=True)
+    glossary = load_pronunciation_glossary(work_dir=work_dir)
 
     for i, seg in enumerate(segments):
         zh_text = normalize_spoken_datetime(seg.get("zh_text", "") or "")
@@ -1523,9 +1809,10 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
             seg["actual_duration"] = get_audio_duration(output_path)
         else:
             ref_audio = get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir)
+            tts_text = annotate_tts_text(zh_text, glossary=glossary)
             tts.infer(
                 spk_audio_prompt=ref_audio,
-                text=zh_text,
+                text=tts_text,
                 output_path=output_path,
                 lang="zh",
                 emo_audio_prompt=ref_audio,
@@ -1997,6 +2284,83 @@ def list_dub_segments(video_path, work_dir="dub_workspace"):
     return rows
 
 
+_SUSPICIOUS_MONTH_RE = re.compile(rf"(?i)\b({_MONTH_ALT})\b")
+_SUSPICIOUS_AMPM_RE = re.compile(rf"(?i)\b{_MERIDIEM}\b")
+_SUSPICIOUS_CLOCK_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+_SUSPICIOUS_WEEKDAY_RE = re.compile(
+    rf"(?i)\b({_WEEKDAY_FULL_ALT}|weekend)\b"
+)
+_SUSPICIOUS_MONEY_RE = re.compile(
+    r"[$€£¥￥]|\b(?:USD|EUR|GBP|RMB|CNY)\b|\b(?:dollars?|euros?|pounds?|yuan)\b",
+    re.I,
+)
+
+
+def _ascii_letter_ratio(text):
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return 0.0
+    letters = sum(1 for c in chars if ("A" <= c <= "Z") or ("a" <= c <= "z"))
+    return letters / len(chars)
+
+
+def find_suspicious_segments(segments):
+    """Return segments that likely need redub (empty zh, leftover EN, pace)."""
+    rows = []
+    for i, seg in enumerate(segments):
+        zh = (seg.get("zh_text") or "").strip()
+        en = (seg.get("text") or "").strip()
+        reasons = []
+        if not zh:
+            if en:
+                reasons.append("empty_zh")
+        else:
+            if zh == en and re.search(r"[A-Za-z]{3,}", zh):
+                reasons.append("leftover_english")
+            elif _ascii_letter_ratio(zh) >= 0.35 and len(re.findall(r"[A-Za-z]", zh)) >= 4:
+                reasons.append("leftover_english")
+            if _SUSPICIOUS_MONTH_RE.search(zh) or _SUSPICIOUS_AMPM_RE.search(zh) or _SUSPICIOUS_CLOCK_RE.search(zh):
+                reasons.append("leftover_datetime")
+            if _SUSPICIOUS_MONEY_RE.search(zh):
+                reasons.append("leftover_money")
+            if _SUSPICIOUS_WEEKDAY_RE.search(zh):
+                reasons.append("leftover_weekday")
+            duration = float(seg.get("end", 0) or 0) - float(seg.get("start", 0) or 0)
+            n_chars = len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", zh))
+            if duration >= 1.0 and n_chars:
+                cps = n_chars / duration
+                if cps > CHARS_PER_SECOND * 1.6:
+                    reasons.append("too_fast")
+                elif cps < CHARS_PER_SECOND * 0.35 and n_chars >= 2:
+                    reasons.append("too_slow")
+        if not reasons:
+            continue
+        rows.append({
+            "id": i,
+            "speaker": seg.get("speaker"),
+            "start": seg.get("start"),
+            "end": seg.get("end"),
+            "text": en,
+            "zh_text": zh,
+            "reasons": reasons,
+        })
+    return rows
+
+
+def list_suspicious_segments(video_path, work_dir="dub_workspace"):
+    """Print checkpoint sentences that likely need a redub pass."""
+    _video_work_dir_path, ckpt = _load_work_state(work_dir, video_path)
+    rows = find_suspicious_segments(ckpt["segments"])
+    print(f"  {len(rows)} suspicious / {len(ckpt['segments'])} segments in {_video_work_dir_path}")
+    for row in rows:
+        zh = (row.get("zh_text") or "").replace("\n", " ")
+        print(
+            f"[{row['id']:3d}] {','.join(row['reasons']):28} "
+            f"{row['start']:7.1f}-{row['end']:7.1f}  {zh}"
+        )
+    return rows
+
+
 def parse_redub_file(path):
     """Parse `id<TAB>zh_text` lines into {id: zh_text}."""
     patches = {}
@@ -2201,10 +2565,19 @@ def dub_video(
 
     # --- Step 3: ASR + diarization ---
     if done < 3:
-        print("\n[Step 3/11] Transcribing and diarizing...")
-        segments = transcribe_and_diarize(
-            vocals_path, hf_token, num_speakers, whisper_model=whisper_model,
+        skip_asr = should_skip_asr(
+            num_speakers, video_path,
+            no_external_subs=no_external_subs, external_subs=external_subs,
         )
+        if skip_asr:
+            print("\n[Step 3/11] Skipping Whisper (single speaker + cleaned subtitles)...")
+            segments = dummy_single_speaker_segments(vocals_path)
+            paths["skipped_asr"] = True
+        else:
+            print("\n[Step 3/11] Transcribing and diarizing...")
+            segments = transcribe_and_diarize(
+                vocals_path, hf_token, num_speakers, whisper_model=whisper_model,
+            )
         transcript_path = os.path.join(video_work_dir, "transcript.json")
         with open(transcript_path, "w", encoding="utf-8") as f:
             json.dump(segments, f, ensure_ascii=False, indent=2)
@@ -2259,8 +2632,7 @@ def dub_video(
             if sub_source:
                 print(f"  {len(segments) - untranslated} from external subs, {untranslated} need LLM")
             llm_client = LLMClient(api_key=llm_api_key, api_base=llm_api_base, model=llm_model)
-            segments, _ = translate_segments(segments, llm_client,
-                                             skip_translated=bool(sub_source))
+            segments, _ = translate_segments(segments, llm_client, skip_translated=True)
         translations_path = os.path.join(video_work_dir, "translations.json")
         with open(translations_path, "w", encoding="utf-8") as f:
             json.dump(
@@ -2270,6 +2642,16 @@ def dub_video(
                 f, ensure_ascii=False, indent=2,
             )
         print(f"  Saved translations: {translations_path}")
+        failed = untranslated_segment_ids(segments)
+        if failed:
+            _save_checkpoint(video_work_dir, 5, segments=segments, paths=paths)
+            preview = failed[:20]
+            more = f" (+{len(failed) - 20} more)" if len(failed) > 20 else ""
+            raise RuntimeError(
+                f"Translation failed for {len(failed)} segment(s) {preview}{more}. "
+                "Not falling back to English. Re-run to retry; already-translated "
+                "sentences are kept."
+            )
         _save_checkpoint(video_work_dir, 6, segments=segments, paths=paths)
     else:
         print(f"\n[Step 5/11] Skipped (cached)")
@@ -2464,6 +2846,10 @@ def main():
         help="List checkpoint sentence ids (after a previous dub) and exit",
     )
     parser.add_argument(
+        "--list-suspicious", action="store_true",
+        help="List checkpoint sentences that likely need redub and exit",
+    )
+    parser.add_argument(
         "--redub", default=None,
         help="Comma-separated sentence ids to re-TTS and remux (e.g. 12,15)",
     )
@@ -2480,6 +2866,10 @@ def main():
 
     if args.list_segments:
         list_dub_segments(args.input, work_dir=args.work_dir)
+        return
+
+    if args.list_suspicious:
+        list_suspicious_segments(args.input, work_dir=args.work_dir)
         return
 
     if args.redub or args.redub_file:

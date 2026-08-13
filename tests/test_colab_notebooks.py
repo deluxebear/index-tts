@@ -45,6 +45,15 @@ def test_pipeline_notebooks_share_cache_and_v25():
         assert "models_cache" not in text, name
 
 
+def test_dubbing_notebook_uses_drive_work_dir():
+    text = _nb_text("DubbingPipeline_Colab.ipynb")
+    assert 'WORK_DIR = f"{DRIVE_CACHE}/dub_workspace"' in text
+    assert 'os.listdir(WORK_DIR)' in text
+    assert 'os.listdir("dub_workspace")' not in text
+    assert "list_suspicious_segments" in text
+    assert "跳过 Whisper" in text
+
+
 def test_voxcpm_notebook_cache_root_only():
     text = _nb_text("VoxCPM_DubbingPipeline_Colab.ipynb")
     assert "index-tts-cache" in text
