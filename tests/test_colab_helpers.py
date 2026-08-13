@@ -6,6 +6,7 @@ import pytest
 from tools.colab import (
     build_webui_argv,
     is_colab,
+    repo_root,
     is_webui_healthy,
     parse_cloudflare_url,
     parse_gradio_share_url,
@@ -14,6 +15,10 @@ from tools.colab import (
     wants_cloudflare,
 )
 import tools.colab as colab
+
+
+def test_setup_script_is_next_to_colab_helper():
+    assert (repo_root() / "tools" / "setup_colab.sh").is_file()
 
 
 def test_parse_cloudflare_url_extracts_https_host():

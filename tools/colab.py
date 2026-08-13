@@ -59,6 +59,18 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def setup(*, extra: str = "", verbose: bool = False) -> None:
+    """Run tools/setup_colab.sh (Colab torch stack + optional pipeline extras)."""
+    cmd = ["bash", str(repo_root() / "tools" / "setup_colab.sh")]
+    if extra:
+        cmd.extend(["--extra", extra])
+    if verbose:
+        cmd.append("--verbose")
+    code = subprocess.call(cmd)
+    if code != 0:
+        raise RuntimeError(f"tools/setup_colab.sh failed with exit code {code}")
+
+
 def build_webui_argv(
     *,
     port: int,
