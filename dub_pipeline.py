@@ -709,13 +709,22 @@ def translate_segments(segments, llm_client, batch_size=12, skip_translated=Fals
 
 # Non-dialogue patterns to strip from external subtitles
 _CREDIT_RE = re.compile(
-    r"^(翻译|译者|审核|校对|校订|字幕|时间轴|压制|后期|特效)"
-    r"(人员|者)?[：:]\s*\S+",
+    r"^(翻译|译者|译制|听译|审核|校对|校订|字幕|时间轴|压制|后期|特效|制作)"
+    r"(组|人员|者)?[：:]\s*\S+",
     re.MULTILINE,
 )
 _CREDIT_EN_RE = re.compile(
-    r"^(Translated|Reviewed|Subtitl|Timing|Encoded)\s+by\b",
+    r"^(Translated|Reviewed|Subtitl(?:es|ed)?|Timing|Encoded|Transcript(?:ed)?)\s+by\b",
     re.IGNORECASE | re.MULTILINE,
+)
+_CREDIT_INLINE_RE = re.compile(
+    r"[（(\[]\s*(?:翻译|译者|译制|字幕|校对|Translated\s+by|Subtitles?\s+by)[^)\]）]*[)\]）]",
+    re.IGNORECASE,
+)
+_CREDIT_WHOLE_RE = re.compile(
+    r"^(?:字幕组|字幕制作|听写稿|感谢观看|请不吝点赞|"
+    r"thanks?\s+(?:you\s+)?for\s+watching|please\s+subscribe)\b",
+    re.IGNORECASE,
 )
 # Speaker label: "比拉瓦尔·西杜（BS）:" or "克里斯·安德森（Chris Anderson）：" at start of cue.
 # Full-name form always matches; bare abbreviation form collected dynamically.
@@ -726,6 +735,23 @@ _SPEAKER_FULL_RE = re.compile(
 _SPEAKER_BARE_RE_TMPL = r"^(?:{})\s*[：:]\s*"
 # Generic bare uppercase label: "BS:", "CA：", "SA :" etc. — always stripped.
 _SPEAKER_GENERIC_BARE_RE = re.compile(r"^[A-Z]{1,5}\s*[：:]\s*")
+_SPEAKER_EN_NAME_RE = re.compile(
+    r"^(?:>>\s*)?[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s*[：:]\s*"
+)
+_SPEAKER_ROLE_RE = re.compile(
+    r"^(?:主持人|嘉賓|嘉宾|旁白|解说|記者|记者|觀眾|观众|采访者|受访者)"
+    r"[ABC甲乙丙丁0-9]{0,2}\s*[：:]\s*"
+)
+# 2–4 CJK chars + colon is often a name; skip discourse connectives.
+_SPEAKER_ZH_NAME_RE = re.compile(r"^[\u4e00-\u9fff]{2,4}\s*[：:]\s*")
+_ZH_NOT_SPEAKER = frozenset(
+    "所以 但是 因为 因為 如果 然后 然後 接着 接著 而且 不过 不過 可是 于是 於是 "
+    "因此 其实 其實 当然 當然 那么 那麼 就是 不是 没有 沒有 这个 這個 那个 那個 "
+    "什么 什麼 怎么 怎麼 为什么 為什麼 现在 現在 今天 我们 我們 他们 他們 你们 你們 "
+    "大家 其实 还有 還有 或者 以及 虽然 雖然 尽管 儘管 除了 关于 關於".split()
+)
+_HTML_TAG_RE = re.compile(r"</?[^>]+>")
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _SOUND_BRACKET_RE = re.compile(r"[\[【（\(]([^)\]】）]*)[\]】）\)]")
 _MUSIC_RE = re.compile(r"[♪♫🎵🎶].*?[♪♫🎵🎶]|^[♪♫🎵🎶]+$", re.MULTILINE)
 _SOUND_KEYWORDS = frozenset(
@@ -850,8 +876,22 @@ def _is_sound_description(match):
     return False
 
 
+def _strip_speaker_prefix(line, speaker_re):
+    """Strip one speaker/role label from the start of a line; keep the dialogue."""
+    text = speaker_re.sub("", line)
+    text = _SPEAKER_GENERIC_BARE_RE.sub("", text)
+    text = _SPEAKER_EN_NAME_RE.sub("", text)
+    text = _SPEAKER_ROLE_RE.sub("", text)
+    zh = _SPEAKER_ZH_NAME_RE.match(text)
+    if zh:
+        name = text[: zh.end()].split("：")[0].split(":")[0].strip()
+        if name not in _ZH_NOT_SPEAKER:
+            text = text[zh.end() :]
+    return text
+
+
 def clean_subtitle_cues(cues):
-    """Remove non-dialogue entries (credits, sound descriptions, music) from cues."""
+    """Remove credits, speaker labels, and non-speech marks so cues can be spoken."""
     # Pass 1: collect known speaker abbreviations from full-name labels
     # e.g. "比拉瓦尔·西杜（BS）:" → "BS"
     # e.g. "克里斯·安德森（Chris Anderson）:" → derive "CA" from initials
@@ -883,26 +923,34 @@ def clean_subtitle_cues(cues):
 
     cleaned = []
     for cue in cues:
-        text = cue["text"]
+        raw = cue["text"]
+        raw = _HTML_TAG_RE.sub("", raw)
+        raw = raw.replace("&nbsp;", " ").replace("{", "").replace("}", "")
+        raw = _URL_RE.sub("", raw)
+        raw = _CREDIT_INLINE_RE.sub("", raw)
 
-        # Strip speaker labels (keep dialogue after the label)
-        text = speaker_re.sub("", text)
-        text = _SPEAKER_GENERIC_BARE_RE.sub("", text)
+        lines = []
+        for line in re.split(r"[\n\\N]+", raw):
+            line = line.strip()
+            if not line:
+                continue
+            if _CREDIT_RE.search(line) or _CREDIT_EN_RE.search(line) or _CREDIT_WHOLE_RE.search(line):
+                continue
+            line = _strip_speaker_prefix(line, speaker_re)
+            line = line.strip()
+            if not line:
+                continue
+            if _CREDIT_RE.search(line) or _CREDIT_EN_RE.search(line) or _CREDIT_WHOLE_RE.search(line):
+                continue
+            line = _SOUND_BRACKET_RE.sub(
+                lambda m: "" if _is_sound_description(m) else m.group(0), line
+            )
+            line = _MUSIC_RE.sub("", line).strip()
+            if line:
+                lines.append(line)
 
-        # Then check if remaining text is a credit line
-        if _CREDIT_RE.search(text) or _CREDIT_EN_RE.search(text):
-            continue
-
-        # Remove sound descriptions in brackets
-        text = _SOUND_BRACKET_RE.sub(
-            lambda m: "" if _is_sound_description(m) else m.group(0), text
-        )
-
-        # Remove music markers
-        text = _MUSIC_RE.sub("", text)
-
-        text = text.strip()
-        if not text:
+        text = " ".join(lines).strip()
+        if not text or _CREDIT_WHOLE_RE.search(text):
             continue
 
         cue = dict(cue)
@@ -1154,9 +1202,6 @@ def build_subtitle_driven_segments(video_path, asr_segments, external_subs=None)
     sub_path, lang_hint = discover_subtitle(external_subs or video_path)
     if sub_path is None:
         return None, None
-    if lang_hint == "en":
-        print("  Found English-only subtitle, will use LLM translation instead")
-        return None, None
 
     parser = parse_ass if sub_path.endswith(".ass") else parse_srt
     cues = parser(sub_path)
@@ -1169,7 +1214,12 @@ def build_subtitle_driven_segments(video_path, asr_segments, external_subs=None)
         print("  Warning: all subtitle cues were non-dialogue, skipping")
         return None, None
 
+    if lang_hint == "unknown":
+        sample = " ".join(c["text"] for c in cues[:50])
+        lang_hint = detect_subtitle_language(sample)
+
     source_desc = lang_hint
+    is_english = lang_hint == "en"
     if lang_hint == "zht":
         print("  Converting Traditional Chinese → Simplified Chinese...")
         cues = convert_traditional_to_simplified(cues)
@@ -1185,17 +1235,29 @@ def build_subtitle_driven_segments(video_path, asr_segments, external_subs=None)
     sorted_asr = sorted(asr_segments, key=lambda s: s["start"])
     segments = []
     for cue in sorted(cues, key=lambda c: c["start"]):
-        spk, en_text = _cue_speaker_and_text(cue, sorted_asr)
-        segments.append({
-            "start": cue["start"],
-            "end": cue["end"],
-            "text": en_text,            # original language, best-effort for EN subtitle
-            "zh_text": cue["text"],     # the Chinese to speak (verbatim from subtitle)
-            "speaker": spk or default_spk,
-        })
+        spk, asr_en = _cue_speaker_and_text(cue, sorted_asr)
+        if is_english:
+            segments.append({
+                "start": cue["start"],
+                "end": cue["end"],
+                "text": cue["text"],
+                "speaker": spk or default_spk,
+            })
+        else:
+            segments.append({
+                "start": cue["start"],
+                "end": cue["end"],
+                "text": asr_en or cue["text"],
+                "zh_text": cue["text"],
+                "speaker": spk or default_spk,
+            })
 
-    print(f"  Subtitle-driven: {len(segments)} cues used as segments "
-          f"(ASR had {len(asr_segments)} segments)")
+    if is_english:
+        print(f"  Subtitle-driven (EN): {len(segments)} cleaned cues will be LLM-translated "
+              f"(ASR had {len(asr_segments)} segments)")
+    else:
+        print(f"  Subtitle-driven: {len(segments)} cues used as segments "
+              f"(ASR had {len(asr_segments)} segments)")
     return segments, f"{source_desc}:{Path(sub_path).name}"
 
 
