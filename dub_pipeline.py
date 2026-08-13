@@ -137,6 +137,129 @@ def normalize_spoken_dates(text):
     return text
 
 
+_EN_HOUR_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+_HOUR_WORD_ALT = "|".join(sorted(_EN_HOUR_WORDS, key=len, reverse=True))
+_MERIDIEM = r"(?:a\.?m\.?|p\.?m\.?)"
+
+
+def _parse_hour_token(token):
+    token = token.lower()
+    if token.isdigit():
+        return int(token)
+    return _EN_HOUR_WORDS[token]
+
+
+def _zh_clock(hour, minute=0, meridiem=None):
+    hour = int(hour)
+    minute = int(minute or 0)
+    if meridiem:
+        mer = re.sub(r"[.\s]", "", meridiem.lower())
+        if mer == "am":
+            if hour == 12:
+                hour = 0
+        elif mer == "pm" and hour != 12:
+            hour += 12
+    hour = hour % 24
+    if meridiem is None and 1 <= hour <= 12:
+        if minute == 0:
+            return f"{hour}点"
+        if minute == 30:
+            return f"{hour}点半"
+        return f"{hour}点{minute}分"
+    if hour == 0:
+        period, h12 = "凌晨", 12
+    elif hour < 6:
+        period, h12 = "凌晨", hour
+    elif hour < 12:
+        period, h12 = "上午", hour
+    elif hour == 12:
+        period, h12 = "中午", 12
+    elif hour < 19:
+        period, h12 = "下午", hour - 12
+    else:
+        period, h12 = "晚上", hour - 12
+    if minute == 0:
+        return f"{period}{h12}点"
+    if minute == 30:
+        return f"{period}{h12}点半"
+    return f"{period}{h12}点{minute}分"
+
+
+def normalize_spoken_times(text):
+    """Rewrite leftover English / numeric clock times into spoken Chinese.
+
+    Idempotent on already-normalized strings such as ``下午3点``.
+    Requires two-digit minutes in ``H:MM`` so ratios like ``3:1`` are left alone.
+    """
+    if not text:
+        return text
+
+    def hour_token(m, g):
+        return _parse_hour_token(m.group(g))
+
+    def repl_half(m):
+        return _zh_clock(hour_token(m, 1), 30)
+
+    def repl_q_past(m):
+        return _zh_clock(hour_token(m, 1), 15)
+
+    def repl_q_to(m):
+        return _zh_clock((hour_token(m, 1) - 1) % 12 or 12, 45)
+
+    def repl_hmm_mer(m):
+        minute = int(m.group(2))
+        if minute > 59:
+            return m.group(0)
+        return _zh_clock(int(m.group(1)), minute, m.group(3))
+
+    def repl_h_mer(m):
+        return _zh_clock(hour_token(m, 1), 0, m.group(2))
+
+    def repl_oclock(m):
+        return f"{hour_token(m, 1)}点"
+
+    def repl_24h(m):
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if hour > 23 or minute > 59:
+            return m.group(0)
+        return _zh_clock(hour, minute)
+
+    text = re.sub(
+        rf"(?i)\bhalf\s+past\s+(\d{{1,2}}|{_HOUR_WORD_ALT})\b",
+        repl_half, text,
+    )
+    text = re.sub(
+        rf"(?i)\b(?:a\s+)?quarter\s+past\s+(\d{{1,2}}|{_HOUR_WORD_ALT})\b",
+        repl_q_past, text,
+    )
+    text = re.sub(
+        rf"(?i)\b(?:a\s+)?quarter\s+to\s+(\d{{1,2}}|{_HOUR_WORD_ALT})\b",
+        repl_q_to, text,
+    )
+    text = re.sub(
+        rf"(?i)\b(\d{{1,2}}):(\d{{2}})\s*({_MERIDIEM})(?!\w)",
+        repl_hmm_mer, text,
+    )
+    text = re.sub(
+        rf"(?i)\b(\d{{1,2}}|{_HOUR_WORD_ALT})\s*({_MERIDIEM})(?!\w)",
+        repl_h_mer, text,
+    )
+    text = re.sub(
+        rf"(?i)\b(\d{{1,2}}|{_HOUR_WORD_ALT})\s+o['’]clock\b",
+        repl_oclock, text,
+    )
+    text = re.sub(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", repl_24h, text)
+    return text
+
+
+def normalize_spoken_datetime(text):
+    """Normalize leftover English dates then clock times for TTS."""
+    return normalize_spoken_times(normalize_spoken_dates(text))
+
+
 def _run_ffmpeg(*args):
     """Run an ffmpeg command, raising with stderr on failure."""
     try:
@@ -684,6 +807,14 @@ def _build_translation_prompt(to_translate, context, keep_original_str, prev_lin
    - March 2020 → 2020年3月
    - 2024-01-15、01/15/2024 → 2024年1月15日
    - 不要写成 January、1/15、15th
+8. 时刻一律译成配音口播格式，不要保留 AM/PM 或冒号：
+   - 3:00 PM / 3 p.m. / 15:00 → 下午3点
+   - 3:30 PM / half past 3 → 下午3点半
+   - 10:15 AM → 上午10点15分
+   - 12:00 PM → 中午12点；12:00 AM → 凌晨12点
+   - 3 o'clock → 3点
+   - quarter to 5 → 4点45分
+   - 不要写成 3:00、3PM、15:00
 
 返回格式（每行一句，#号对应原句编号）：
 #{to_translate[0][0]} 翻译结果
@@ -746,7 +877,7 @@ def translate_with_context(segments, context, llm_client, batch_size=12,
             for idx, seg in pending:
                 zh_text = parsed.get(idx)
                 if zh_text is not None:
-                    zh_text = normalize_spoken_dates(zh_text)
+                    zh_text = normalize_spoken_datetime(zh_text)
                     seg["zh_text"] = zh_text
                     translated.append({"id": idx, "zh_text": zh_text})
                 else:
@@ -1376,7 +1507,7 @@ def generate_speech(segments, speaker_refs, vocals_path, work_dir, tts):
     os.makedirs(seg_ref_dir, exist_ok=True)
 
     for i, seg in enumerate(segments):
-        zh_text = normalize_spoken_dates(seg.get("zh_text", "") or "")
+        zh_text = normalize_spoken_datetime(seg.get("zh_text", "") or "")
         if zh_text:
             seg["zh_text"] = zh_text
         if not zh_text.strip():
