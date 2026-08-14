@@ -81,6 +81,9 @@ def test_novel_notebook_uses_drive_work_dir():
     assert "cleanup=CLEANUP" in text
     assert "ref_mode=REF_MODE" in text
     assert "force_tts=True" in text
+    assert "REF_AUDIO =" in text
+    assert "examples/voice_05.wav" in text
+    assert "BATCH_REF  = ref_audio" not in text
 
 
 def test_voxcpm_notebook_cache_root_only():
