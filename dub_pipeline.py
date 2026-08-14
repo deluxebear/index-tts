@@ -3283,11 +3283,70 @@ def dub_video(
     return output_path
 
 
+def parse_num_speakers_map(spec):
+    """Parse per-video speaker counts from a dict, ``a=1,b=2`` string, or list."""
+    if not spec:
+        return {}
+    if isinstance(spec, dict):
+        out = {}
+        for key, value in spec.items():
+            if key is None or value is None or str(key).strip() == "":
+                continue
+            out[str(key).strip().replace("\\", "/")] = int(value)
+        return out
+    if isinstance(spec, str):
+        items = [part.strip() for part in spec.split(",") if part.strip()]
+    else:
+        items = [str(part).strip() for part in spec if str(part).strip()]
+    out = {}
+    for item in items:
+        if "=" in item:
+            name, count = item.rsplit("=", 1)
+        elif ":" in item:
+            name, count = item.rsplit(":", 1)
+        else:
+            raise ValueError(f"expected NAME=N, got {item!r}")
+        name = name.strip().replace("\\", "/")
+        if not name:
+            raise ValueError(f"expected NAME=N, got {item!r}")
+        out[name] = int(count.strip())
+    return out
+
+
+def lookup_num_speakers(video_path, input_dir, default=None, overrides=None):
+    """Resolve speaker count: more specific path keys win over filename/stem."""
+    overrides = parse_num_speakers_map(overrides)
+    if not overrides:
+        return default
+    video = Path(video_path)
+    input_dir = Path(input_dir)
+    keys = []
+    try:
+        rel = video.relative_to(input_dir)
+        keys.append(str(rel).replace("\\", "/"))
+        keys.append(str(rel.with_suffix("")).replace("\\", "/"))
+    except ValueError:
+        pass
+    keys.extend([video.name, video.stem])
+    lower = {key.lower(): value for key, value in overrides.items()}
+    seen = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if key in overrides:
+            return overrides[key]
+        if key.lower() in lower:
+            return lower[key.lower()]
+    return default
+
+
 def dub_batch(
     input_dir,
     output_dir=None,
     video_extensions=(".mp4", ".mkv", ".mov", ".avi"),
     recursive=False,
+    num_speakers_map=None,
     **kwargs,
 ):
     """
@@ -3300,6 +3359,9 @@ def dub_batch(
         recursive: Recurse into subdirectories, preserving their structure in
             the output (and per-video work dir) so same-named videos in
             different folders don't collide.
+        num_speakers_map: Optional per-video speaker counts. Keys may be a
+            filename (``talk.mp4``), stem (``talk``), or relative path
+            (``interviews/qna.mp4``). Unlisted videos use ``num_speakers``.
         **kwargs: All other arguments passed to dub_video().
     """
     input_dir = Path(input_dir)
@@ -3310,6 +3372,10 @@ def dub_batch(
 
     out_resolved = output_dir.resolve()
     base_work_dir = kwargs.pop("work_dir", "dub_workspace")
+    default_speakers = kwargs.pop("num_speakers", None)
+    speaker_overrides = parse_num_speakers_map(
+        num_speakers_map if num_speakers_map is not None else kwargs.pop("num_speakers_map", None)
+    )
 
     if recursive:
         candidates = sorted(input_dir.rglob("*"))
@@ -3348,8 +3414,16 @@ def dub_batch(
         out_path = str(out_path)
         # Mirror subdir structure in the work dir to avoid same-stem collisions
         video_work_dir = os.path.join(base_work_dir, *rel.parent.parts) if rel.parent.parts else base_work_dir
+        n_speakers = lookup_num_speakers(
+            video, input_dir, default=default_speakers, overrides=speaker_overrides,
+        )
+        if speaker_overrides and n_speakers != default_speakers:
+            print(f"  num_speakers={n_speakers} (override)")
         try:
-            dub_video(str(video), out_path, tts=tts, work_dir=video_work_dir, **kwargs)
+            dub_video(
+                str(video), out_path, tts=tts, work_dir=video_work_dir,
+                num_speakers=n_speakers, **kwargs,
+            )
             results.append((str(rel), "OK", out_path))
         except Exception as e:
             print(f"FAILED: {rel} — {e}")
@@ -3386,7 +3460,11 @@ def main():
     parser.add_argument("--model-dir", default="checkpoints", help="IndexTTS2 model directory")
     parser.add_argument("--fp16", action="store_true", default=True, help="Use FP16 inference (default: True)")
     parser.add_argument("--no-fp16", action="store_true", help="Disable FP16 inference")
-    parser.add_argument("--num-speakers", type=int, default=None, help="Hint for number of speakers")
+    parser.add_argument("--num-speakers", type=int, default=None, help="Default hint for number of speakers")
+    parser.add_argument(
+        "--num-speakers-for", action="append", default=None, metavar="NAME=N",
+        help="Per-video speaker count (repeatable), e.g. talk.mp4=1 or interviews/qna=3",
+    )
     parser.add_argument("--hf-token", default=None, help="HuggingFace token (or set HF_TOKEN env var)")
     parser.add_argument("--llm-api-key", default=None, help="LLM API key (or set LLM_API_KEY env var)")
     parser.add_argument("--llm-api-base", default="https://api.openai.com/v1", help="LLM API base URL")
@@ -3505,7 +3583,11 @@ def main():
     )
 
     if args.batch:
-        dub_batch(args.input, args.output, recursive=args.recursive, **common_kwargs)
+        dub_batch(
+            args.input, args.output, recursive=args.recursive,
+            num_speakers_map=parse_num_speakers_map(args.num_speakers_for),
+            **common_kwargs,
+        )
     else:
         dub_video(args.input, args.output, **common_kwargs)
 

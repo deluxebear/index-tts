@@ -56,6 +56,8 @@ def test_dubbing_notebook_uses_drive_work_dir():
     assert "/content/{stem}_cn.mp4" not in text
     assert "FORCE_UPLOAD" in text
     assert "except Exception:" in text
+    assert "NUM_SPEAKERS_FOR" in text
+    assert "num_speakers_map" in text
 
 
 def test_voxcpm_notebook_cache_root_only():

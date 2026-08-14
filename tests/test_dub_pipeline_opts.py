@@ -1,7 +1,16 @@
 import inspect
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from dub_pipeline import dub_video, transcribe_and_diarize
+import pytest
+
+from dub_pipeline import (
+    dub_batch,
+    dub_video,
+    lookup_num_speakers,
+    parse_num_speakers_map,
+    transcribe_and_diarize,
+)
 
 
 def test_dub_video_accepts_new_speed_kwargs():
@@ -34,3 +43,46 @@ def test_single_speaker_skips_diarization():
     assert not hasattr(whisperx, "diarize") or whisperx.diarize.DiarizationPipeline.call_count == 0
     assert all(s["speaker"] == "SPEAKER_00" for s in segs)
     assert len(segs) == 2
+
+
+def test_parse_num_speakers_map_accepts_dict_and_strings():
+    assert parse_num_speakers_map(None) == {}
+    assert parse_num_speakers_map({"talk.mp4": 1, "qna": 3}) == {"talk.mp4": 1, "qna": 3}
+    assert parse_num_speakers_map("talk.mp4=1,qna:3") == {"talk.mp4": 1, "qna": 3}
+    assert parse_num_speakers_map(["interviews/qna.mp4=4"]) == {"interviews/qna.mp4": 4}
+    with pytest.raises(ValueError):
+        parse_num_speakers_map("talk")
+
+
+def test_lookup_num_speakers_prefers_specific_keys(tmp_path):
+    root = tmp_path / "in"
+    video = root / "interviews" / "qna.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x")
+    overrides = {"qna.mp4": 3, "interviews/qna.mp4": 4, "talk": 1}
+    assert lookup_num_speakers(video, root, default=2, overrides=overrides) == 4
+    assert lookup_num_speakers(root / "talk.mp4", root, default=2, overrides=overrides) == 1
+    assert lookup_num_speakers(root / "other.mp4", root, default=2, overrides=overrides) == 2
+
+
+def test_dub_batch_passes_per_video_speaker_override(tmp_path, monkeypatch):
+    root = tmp_path / "in"
+    root.mkdir()
+    (root / "solo.mp4").write_bytes(b"x")
+    (root / "panel.mp4").write_bytes(b"x")
+    seen = []
+
+    def _fake_dub(video_path, output_path, tts=None, work_dir=None, **kwargs):
+        seen.append((Path(video_path).name, kwargs.get("num_speakers")))
+        return output_path
+
+    monkeypatch.setattr("dub_pipeline._init_tts", lambda *a, **k: object())
+    monkeypatch.setattr("dub_pipeline.dub_video", _fake_dub)
+    dub_batch(
+        str(root),
+        output_dir=str(tmp_path / "out"),
+        num_speakers=2,
+        num_speakers_map={"solo.mp4": 1},
+    )
+    assert ("solo.mp4", 1) in seen
+    assert ("panel.mp4", 2) in seen
