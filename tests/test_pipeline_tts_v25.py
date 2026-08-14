@@ -1,10 +1,12 @@
 import sys
 import types
+from pathlib import Path
 
 from dub_pipeline import _init_tts as dub_init_tts
 from dub_pipeline import generate_speech
 from highlight_pipeline import _init_tts as highlight_init_tts
 from highlight_pipeline import generate_narration
+from novel_pipeline import synthesize_chapter
 
 
 def _install_fake_v25(monkeypatch):
@@ -87,4 +89,26 @@ def test_generate_narration_passes_lang_zh(tmp_path, monkeypatch):
 
     script = [{"narration": "你好", "emo_vector": None}]
     generate_narration(script, "ref.wav", str(tmp_path))
+    assert recorded.get("lang") == "zh"
+
+
+def test_novel_synthesize_uses_lang_zh(tmp_path, monkeypatch):
+    recorded = {}
+
+    class FakeTTS:
+        def normalize_emo_vec(self, vec):
+            return vec
+
+        def infer(self, **kwargs):
+            recorded.update(kwargs)
+            p = kwargs["output_path"]
+            Path(p).parent.mkdir(parents=True, exist_ok=True)
+            Path(p).write_bytes(b"RIFF")
+
+    utts = [{
+        "chapter_id": "c01", "seq": 0, "speaker_id": "narrator",
+        "tts_text": "你好", "lang": "zh", "emo_vector": [0] * 8,
+        "duration_factor": 1.0, "silence_after_ms": 200,
+    }]
+    synthesize_chapter(utts, {"narrator": {"ref_wav": "ref.wav"}}, FakeTTS(), str(tmp_path))
     assert recorded.get("lang") == "zh"
