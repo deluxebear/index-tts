@@ -1,11 +1,13 @@
 from novel_pipeline import (
     assign_seed_voices,
+    assign_silence,
     build_card_text,
     enforce_tts_limits,
     extract_characters,
     generate_character_voices,
     ingest_text,
     merge_character_lists,
+    prepare_tts_text,
     split_chapters,
     split_utterances,
     validate_character,
@@ -128,5 +130,24 @@ def test_generate_character_voices_writes_card(tmp_path):
     assert recorded[0]["lang"] == "zh"
     assert recorded[0]["spk_audio_prompt"] == "seed.wav"
     assert out[0]["ref_wav"].endswith("zhang_san.wav")
+
+
+def test_assign_silence_longer_on_speaker_change():
+    utts = [
+        {"speaker_id": "narrator", "kind": "narration"},
+        {"speaker_id": "zhang_san", "kind": "dialogue"},
+        {"speaker_id": "zhang_san", "kind": "dialogue"},
+        {"speaker_id": "narrator", "kind": "narration"},
+    ]
+    out = assign_silence(utts)
+    assert out[0]["silence_after_ms"] == 420
+    assert out[1]["silence_after_ms"] == 280
+    assert out[2]["silence_after_ms"] == 350
+
+
+def test_prepare_tts_text_applies_glossary(tmp_path, monkeypatch):
+    (tmp_path / "pronunciation.yaml").write_text("银行: 银<行|HANG2>\n", encoding="utf-8")
+    text = prepare_tts_text("他去银行了", str(tmp_path))
+    assert "<行|HANG2>" in text
 
 

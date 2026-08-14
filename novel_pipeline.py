@@ -5,6 +5,7 @@ Task 1 provides text ingest, chapter splitting, and silent WAV concatenation.
 Task 2 adds dialogue/narration split and IndexTTS 2.5 sentence-length limits.
 Task 3 adds LLM style/character analysis and validation helpers.
 Task 4 adds seed voice bank matching and IndexTTS-2.5 character voice cards.
+Task 5 builds per-chapter reading scripts (speaker, emotion, glossary, silence).
 """
 
 from __future__ import annotations
@@ -18,6 +19,11 @@ from typing import Any
 
 import yaml
 
+from dub_pipeline import (
+    annotate_tts_text,
+    estimate_emotion_from_text,
+    load_pronunciation_glossary,
+)
 from highlight_pipeline import LLMClient, _parse_json_response  # noqa: F401
 
 # Chinese chapter headings: 第N章 / 第N节 / 第N回 / 第N卷
@@ -998,6 +1004,328 @@ def generate_character_voices(
     manifest_path = voices_dir / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Task 5: chapter reading script — speaker attribution, emotion, glossary
+# ---------------------------------------------------------------------------
+
+_SILENCE_SPEAKER_CHANGE_MS = 420
+_SILENCE_SAME_SPEAKER_MS = 280
+_SILENCE_DIALOGUE_TO_NARRATION_MS = 350
+_LLM_UTTERANCE_BATCH = 40
+_DURATION_FACTOR_MIN = 0.5
+_DURATION_FACTOR_MAX = 2.0
+
+
+def prepare_tts_text(text: str, work_dir: str) -> str:
+    """
+    Apply pronunciation glossary (repo default + work_dir override) to TTS text.
+
+    Uses ``annotate_tts_text`` with glossary from
+    ``load_pronunciation_glossary(work_dir=work_dir)``.
+    """
+    if not text:
+        return text or ""
+    glossary = load_pronunciation_glossary(work_dir=work_dir)
+    return annotate_tts_text(text, glossary=glossary)
+
+
+def assign_silence(utterances: list[dict]) -> list[dict]:
+    """
+    Set ``silence_after_ms`` on each utterance from speaker/kind transitions.
+
+    Rules (priority: dialogue→narration > speaker change > same speaker):
+      - dialogue → narration: 350 ms
+      - speaker change: 420 ms
+      - same speaker: 280 ms
+    Last utterance uses same-speaker default (280).
+    """
+    if not utterances:
+        return []
+
+    out: list[dict] = []
+    n = len(utterances)
+    for i, raw in enumerate(utterances):
+        utt = dict(raw)
+        if i >= n - 1:
+            utt["silence_after_ms"] = _SILENCE_SAME_SPEAKER_MS
+            out.append(utt)
+            continue
+
+        nxt = utterances[i + 1]
+        cur_spk = str(utt.get("speaker_id") or "")
+        next_spk = str(nxt.get("speaker_id") or "")
+        cur_kind = str(utt.get("kind") or "")
+        next_kind = str(nxt.get("kind") or "")
+
+        if cur_kind == "dialogue" and next_kind == "narration":
+            utt["silence_after_ms"] = _SILENCE_DIALOGUE_TO_NARRATION_MS
+        elif cur_spk != next_spk:
+            utt["silence_after_ms"] = _SILENCE_SPEAKER_CHANGE_MS
+        else:
+            utt["silence_after_ms"] = _SILENCE_SAME_SPEAKER_MS
+        out.append(utt)
+    return out
+
+
+def _character_lookup(characters: list[dict] | None) -> dict[str, dict]:
+    """Map character id → character dict; always includes narrator if missing."""
+    lookup: dict[str, dict] = {}
+    for ch in characters or []:
+        if not isinstance(ch, dict):
+            continue
+        cid = str(ch.get("id") or "").strip()
+        if cid:
+            lookup[cid] = ch
+    if "narrator" not in lookup:
+        lookup["narrator"] = dict(_DEFAULT_NARRATOR)
+    return lookup
+
+
+def _normalize_emo_vector(raw: Any) -> list[float] | None:
+    """Return 8-dim emotion vector or None if unusable."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        return None
+    if len(raw) == 0:
+        return None
+    return _normalize_base_emo(raw)
+
+
+def _fallback_emo(text: str, character: dict | None) -> list[float]:
+    """LLM-failure emotion: estimate_emotion_from_text, else character base_emo, else calm."""
+    estimated = estimate_emotion_from_text(text or "")
+    if estimated is not None:
+        return _normalize_base_emo(estimated)
+    if character and character.get("base_emo") is not None:
+        return _normalize_base_emo(character.get("base_emo"))
+    return [0.0] * _EMO_DIMS
+
+
+def _resolve_duration_factor(character: dict | None, style: dict | None) -> float:
+    """Prefer character duration_factor, else style, else 1.0; clamp 0.5–2.0."""
+    for source in (character, style):
+        if not source:
+            continue
+        if source.get("duration_factor") is None:
+            continue
+        try:
+            return _clamp(float(source["duration_factor"]), _DURATION_FACTOR_MIN, _DURATION_FACTOR_MAX)
+        except (TypeError, ValueError):
+            continue
+    return 1.0
+
+
+def _expand_utterances_for_tts(utterances: list[dict], chapter_id: str) -> list[dict]:
+    """Apply enforce_tts_limits to each utterance; re-sequence ids."""
+    expanded: list[dict] = []
+    for utt in utterances:
+        parts = enforce_tts_limits(utt.get("tts_text") or "", max_chars=80)
+        if not parts:
+            text = (utt.get("tts_text") or utt.get("text") or "").strip()
+            if not text:
+                continue
+            parts = [text]
+        for part in parts:
+            nu = dict(utt)
+            nu["tts_text"] = part
+            if utt.get("kind") != "dialogue":
+                nu["text"] = part
+            expanded.append(nu)
+
+    seq = 0
+    out: list[dict] = []
+    for utt in expanded:
+        seq += 1
+        nu = dict(utt)
+        nu["seq"] = seq
+        nu["id"] = f"{chapter_id}_{seq:04d}"
+        nu["chapter_id"] = chapter_id
+        out.append(nu)
+    return out
+
+
+def _llm_attribute_batch(
+    batch: list[dict],
+    characters: list[dict],
+    style: dict | None,
+    llm: Any,
+) -> list[dict] | None:
+    """
+    Ask LLM for speaker_id / emo_vector / tts_text for a batch.
+
+    Returns list of attribution dicts aligned by index, or None on failure.
+    """
+    char_brief = [
+        {
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "aliases": c.get("aliases") or [],
+            "role": c.get("role"),
+        }
+        for c in (characters or [])
+        if isinstance(c, dict)
+    ]
+    items = [
+        {
+            "index": i,
+            "id": u.get("id"),
+            "kind": u.get("kind"),
+            "text": u.get("text"),
+            "tts_text": u.get("tts_text"),
+        }
+        for i, u in enumerate(batch)
+    ]
+    prompt = (
+        "你是小说有声书朗读脚本助手。为每条 utterance 指定说话人与情绪。\n"
+        "只输出 JSON 数组，不要 markdown，不要解释。\n"
+        "每个元素字段：index (与输入相同), speaker_id, emo_vector, tts_text。\n"
+        "speaker_id 必须是人物表中的 id；叙述/旁白用 narrator；无法判断也用 narrator。\n"
+        "emo_vector 为长度 8 的数组，顺序 "
+        "[happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]，每项 0–1。\n"
+        "tts_text：口语化，保留原意，不扩写剧情，不发明旁白；"
+        "可对数字/英文专有名词加 <字|发音> 标注；单条不超过 80 字；不删信息点。\n"
+        "dialogue 的 speaker 应为人物；narration 通常为 narrator。\n\n"
+        f"人物表：{json.dumps(char_brief, ensure_ascii=False)}\n"
+        f"风格 lang={((style or {}).get('lang') or 'zh')}\n"
+        f"utterances：{json.dumps(items, ensure_ascii=False)}"
+    )
+    try:
+        raw = llm.chat(prompt)
+    except Exception:
+        return None
+
+    parsed = _parse_json_response(raw)
+    if parsed is None:
+        return None
+
+    rows: list[dict] = []
+    if isinstance(parsed, list):
+        rows = [r for r in parsed if isinstance(r, dict)]
+    elif isinstance(parsed, dict):
+        inner = parsed.get("utterances") or parsed.get("items") or parsed.get("results")
+        if isinstance(inner, list):
+            rows = [r for r in inner if isinstance(r, dict)]
+        else:
+            return None
+    else:
+        return None
+
+    if not rows:
+        return None
+
+    # Align by index when present; else by order
+    by_index: dict[int, dict] = {}
+    ordered: list[dict] = []
+    for r in rows:
+        if "index" in r:
+            try:
+                by_index[int(r["index"])] = r
+            except (TypeError, ValueError):
+                ordered.append(r)
+        else:
+            ordered.append(r)
+
+    result: list[dict] = []
+    oi = 0
+    for i in range(len(batch)):
+        if i in by_index:
+            result.append(by_index[i])
+        elif oi < len(ordered):
+            result.append(ordered[oi])
+            oi += 1
+        else:
+            result.append({})
+    return result
+
+
+def build_chapter_script(
+    chapter_text: str,
+    chapter_id: str,
+    characters: list[dict],
+    style: dict | None,
+    llm: Any,
+    work_dir: str,
+) -> list[dict]:
+    """
+    Build a full reading script for one chapter.
+
+    Pipeline:
+      split_utterances → enforce_tts_limits → LLM attribution (batches of 40)
+      → validate speaker_id ∈ character table (else narrator)
+      → prepare_tts_text (glossary) → character duration_factor → assign_silence
+
+    LLM failure falls back to ``estimate_emotion_from_text`` (and narrator / original text).
+    """
+    style = style or {}
+    lang = str(style.get("lang") or "zh").strip().lower() or "zh"
+    if lang not in _VALID_LANGS:
+        lang = "zh"
+
+    lookup = _character_lookup(characters)
+    char_list = list(lookup.values())
+
+    raw_utts = split_utterances(chapter_text or "", chapter_id)
+    utterances = _expand_utterances_for_tts(raw_utts, chapter_id)
+
+    # LLM attribution in batches of 40
+    attributions: list[dict | None] = [None] * len(utterances)
+    for start in range(0, len(utterances), _LLM_UTTERANCE_BATCH):
+        batch = utterances[start : start + _LLM_UTTERANCE_BATCH]
+        try:
+            batch_attrs = _llm_attribute_batch(batch, char_list, style, llm)
+        except Exception:
+            batch_attrs = None
+        if batch_attrs is None:
+            for j in range(len(batch)):
+                attributions[start + j] = None
+        else:
+            for j, attr in enumerate(batch_attrs):
+                attributions[start + j] = attr
+
+    built: list[dict] = []
+    for utt, attr in zip(utterances, attributions):
+        item = dict(utt)
+        item["lang"] = lang
+        item["wav_path"] = None
+
+        kind = str(item.get("kind") or "narration")
+        default_speaker = "narrator" if kind != "dialogue" else "narrator"
+
+        speaker_id = default_speaker
+        tts_text = item.get("tts_text") or item.get("text") or ""
+        emo: list[float] | None = None
+
+        if attr and isinstance(attr, dict):
+            sid = str(attr.get("speaker_id") or "").strip()
+            if sid and sid in lookup:
+                speaker_id = sid
+            if attr.get("tts_text"):
+                candidate = str(attr["tts_text"]).strip()
+                if candidate:
+                    tts_text = candidate
+            emo = _normalize_emo_vector(attr.get("emo_vector"))
+
+        # Unknown speaker → narrator
+        if speaker_id not in lookup:
+            speaker_id = "narrator"
+
+        character = lookup.get(speaker_id) or lookup["narrator"]
+        if emo is None:
+            emo = _fallback_emo(item.get("text") or tts_text, character)
+
+        item["speaker_id"] = speaker_id
+        item["emo_vector"] = emo
+        item["tts_text"] = prepare_tts_text(tts_text, work_dir)
+        item["duration_factor"] = _resolve_duration_factor(character, style)
+        built.append(item)
+
+    return assign_silence(built)
+
 
     return out
 
