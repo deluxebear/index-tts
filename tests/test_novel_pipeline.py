@@ -1,6 +1,8 @@
 import json
 import re
 
+import wave
+
 from novel_pipeline import (
     assign_seed_voices,
     assign_silence,
@@ -10,10 +12,12 @@ from novel_pipeline import (
     extract_characters,
     generate_character_voices,
     ingest_text,
+    merge_chapter,
     merge_character_lists,
     prepare_tts_text,
     split_chapters,
     split_utterances,
+    synthesize_chapter,
     validate_character,
     validate_style,
 )
@@ -184,5 +188,74 @@ def test_build_chapter_script_resplits_oversized_llm_tts_text(tmp_path):
         assert len(visible) <= 80
         assert u["speaker_id"] == "narrator"
         assert u["emo_vector"] == emo
+
+
+def _write_wav(path, nframes=2205):
+    with wave.open(str(path), "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        w.writeframes(b"\x00\x00" * nframes)
+
+
+def test_synthesize_chapter_passes_v25_kwargs(tmp_path):
+    recorded = []
+
+    class FakeTTS:
+        def normalize_emo_vec(self, v):
+            return [min(x, 0.8) for x in v]
+
+        def infer(self, **kwargs):
+            recorded.append(kwargs)
+            _write_wav(kwargs["output_path"])
+
+    chars = {"zhang_san": {"ref_wav": "ref.wav", "duration_factor": 0.95}}
+    utts = [{
+        "id": "c01_0000", "chapter_id": "c01", "seq": 0,
+        "speaker_id": "zhang_san", "kind": "dialogue",
+        "text": "别过来。", "tts_text": "别过来。", "lang": "zh",
+        "emo_vector": [0, 0.2, 0, 0, 0, 0, 0, 0.1],
+        "duration_factor": 0.95, "silence_after_ms": 280,
+    }]
+    out = synthesize_chapter(utts, chars, FakeTTS(), str(tmp_path))
+    assert recorded[0]["lang"] == "zh"
+    assert recorded[0]["spk_audio_prompt"] == "ref.wav"
+    assert recorded[0]["duration_factor"] == 0.95
+    assert out[0]["wav_path"].endswith("0000.wav")
+
+
+def test_synthesize_skips_existing(tmp_path):
+    tts_dir = tmp_path / "tts" / "c01"
+    tts_dir.mkdir(parents=True)
+    _write_wav(tts_dir / "0000.wav")
+
+    class BoomTTS:
+        def infer(self, **kwargs):
+            raise AssertionError("should skip")
+
+        def normalize_emo_vec(self, v):
+            return v
+
+    utts = [{
+        "id": "c01_0000", "chapter_id": "c01", "seq": 0,
+        "speaker_id": "zhang_san", "tts_text": "x", "lang": "zh",
+        "emo_vector": [0] * 8, "duration_factor": 1.0, "silence_after_ms": 200,
+    }]
+    synthesize_chapter(utts, {"zhang_san": {"ref_wav": "ref.wav"}}, BoomTTS(), str(tmp_path))
+
+
+def test_merge_chapter_inserts_silence(tmp_path):
+    a = tmp_path / "a.wav"
+    b = tmp_path / "b.wav"
+    out = tmp_path / "c.wav"
+    _write_wav(a, 2205)
+    _write_wav(b, 2205)
+    merge_chapter(
+        [{"wav_path": str(a), "silence_after_ms": 1000},
+         {"wav_path": str(b), "silence_after_ms": 0}],
+        str(out),
+    )
+    with wave.open(str(out)) as w:
+        assert w.getnframes() == 2205 + 22050 + 2205
 
 

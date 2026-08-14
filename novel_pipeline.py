@@ -6,6 +6,7 @@ Task 2 adds dialogue/narration split and IndexTTS 2.5 sentence-length limits.
 Task 3 adds LLM style/character analysis and validation helpers.
 Task 4 adds seed voice bank matching and IndexTTS-2.5 character voice cards.
 Task 5 builds per-chapter reading scripts (speaker, emotion, glossary, silence).
+Task 6 synthesizes lines in order and merges chapter WAVs.
 """
 
 from __future__ import annotations
@@ -1348,4 +1349,138 @@ def build_chapter_script(
         resequenced.append(nu)
 
     return assign_silence(resequenced)
+
+
+# ---------------------------------------------------------------------------
+# Task 6: sequential synthesis and per-chapter merge
+# ---------------------------------------------------------------------------
+
+_TTS_SAMPLE_RATE = 22050
+
+
+def _characters_to_map(characters: Any) -> dict[str, dict]:
+    """Normalize characters to id → dict (accepts list or id-keyed dict)."""
+    if not characters:
+        return {}
+    if isinstance(characters, dict):
+        # id-keyed map (tests) vs single character dict with "id"
+        if "id" in characters and not any(
+            isinstance(v, dict) and ("ref_wav" in v or "id" in v)
+            for v in characters.values()
+        ):
+            cid = str(characters.get("id") or "").strip()
+            return {cid: characters} if cid else {}
+        out: dict[str, dict] = {}
+        for k, v in characters.items():
+            if isinstance(v, dict):
+                out[str(k)] = v
+        return out
+    if isinstance(characters, list):
+        out = {}
+        for ch in characters:
+            if not isinstance(ch, dict):
+                continue
+            cid = str(ch.get("id") or "").strip()
+            if cid:
+                out[cid] = ch
+        return out
+    return {}
+
+
+def _write_silence_wav(path: str | Path, duration_sec: float, sample_rate: int = _TTS_SAMPLE_RATE) -> None:
+    """Write mono 16-bit PCM silence WAV of the given duration."""
+    nframes = max(1, int(duration_sec * sample_rate))
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out), "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(b"\x00\x00" * nframes)
+
+
+def _emo_for_infer(tts: Any, emo_vector: Any) -> list[float] | None:
+    """Normalize emo_vector for infer; None when all dims are zero / missing."""
+    if emo_vector is None:
+        return None
+    if not isinstance(emo_vector, (list, tuple)):
+        return None
+    vals = [float(x) for x in emo_vector]
+    if not vals or not any(v > 0 for v in vals):
+        return None
+    return tts.normalize_emo_vec(vals)
+
+
+def synthesize_chapter(
+    utterances: list[dict],
+    characters: Any,
+    tts: Any,
+    work_dir: str,
+    strict: bool = False,
+) -> list[dict]:
+    """
+    Synthesize each utterance WAV under ``{work_dir}/tts/{chapter_id}/{seq:04d}.wav``.
+
+    Skips lines whose output already exists. On infer failure with ``strict=False``,
+    writes silence of ``max(1.2, 0.15 * len(tts_text))`` seconds (22050 Hz mono 16-bit).
+    Returns utterances with ``wav_path`` set.
+    """
+    char_map = _characters_to_map(characters)
+    out: list[dict] = []
+
+    for raw in utterances or []:
+        utt = dict(raw)
+        chapter_id = str(utt.get("chapter_id") or "c01")
+        try:
+            seq = int(utt.get("seq", 0))
+        except (TypeError, ValueError):
+            seq = 0
+
+        wav_path = Path(work_dir) / "tts" / chapter_id / f"{seq:04d}.wav"
+        wav_path.parent.mkdir(parents=True, exist_ok=True)
+        utt["wav_path"] = str(wav_path)
+
+        if wav_path.is_file():
+            out.append(utt)
+            continue
+
+        speaker_id = str(utt.get("speaker_id") or "").strip()
+        character = char_map.get(speaker_id) or {}
+        ref_wav = character.get("ref_wav")
+        tts_text = str(utt.get("tts_text") or utt.get("text") or "")
+        lang = str(utt.get("lang") or "zh").strip().lower() or "zh"
+
+        try:
+            df = float(utt.get("duration_factor", character.get("duration_factor", 1.0)))
+        except (TypeError, ValueError):
+            df = 1.0
+        duration_factor = _clamp(df, _DURATION_FACTOR_MIN, _DURATION_FACTOR_MAX)
+        emo_vector = _emo_for_infer(tts, utt.get("emo_vector"))
+
+        try:
+            tts.infer(
+                spk_audio_prompt=ref_wav,
+                text=tts_text,
+                output_path=str(wav_path),
+                lang=lang,
+                emo_vector=emo_vector,
+                duration_factor=duration_factor,
+                interval_silence=200,
+                max_text_tokens_per_segment=120,
+                use_random=False,
+            )
+        except Exception:
+            if strict:
+                raise
+            silence_sec = max(1.2, 0.15 * len(tts_text))
+            _write_silence_wav(wav_path, silence_sec)
+
+        out.append(utt)
+
+    return out
+
+
+def merge_chapter(utterances: list[dict], output_path: str) -> str:
+    """Concatenate utterance WAVs with per-line ``silence_after_ms`` via ``_concat_wavs``."""
+    return _concat_wavs(list(utterances or []), output_path)
 
