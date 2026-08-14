@@ -8,24 +8,28 @@ def test_short_caption_stays_one():
     assert split_zh_captions("银<行|HANG2>办理业务") == ["银行办理业务"]
 
 
-def test_splits_on_punctuation_and_wraps_lines():
+def test_splits_on_punctuation_without_wrap():
     text = "这是第一句，里面还有逗号所以会比较长。这是第二句也一样很长需要再拆一次！"
     caps = split_zh_captions(text)
     assert len(caps) >= 2
     for cap in caps:
-        lines = cap.split("\n")
-        assert len(lines) <= 2
-        for line in lines:
-            assert len(line) <= 16
+        assert "\n" not in cap
+        assert len(cap) <= 32
 
 
 def test_hard_wraps_without_punctuation():
     text = "这是一段完全没有标点的超长中文用来确认硬切不会挤在同一屏上面继续往下写"
     caps = split_zh_captions(text)
     assert len(caps) >= 2
-    assert "".join(c.replace("\n", "") for c in caps) == text
+    assert "".join(caps) == text
     for cap in caps:
-        assert len(cap.replace("\n", "")) <= 32
+        assert "\n" not in cap
+        assert len(cap) <= 32
+
+
+def test_screenshot_sentence_stays_one_line():
+    text = "项目宪章只是形式化这些项目级细节的一种方式。"
+    assert split_zh_captions(text) == [text]
 
 
 def test_caption_spans_are_proportional():

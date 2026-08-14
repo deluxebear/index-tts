@@ -2706,8 +2706,8 @@ def _format_srt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-SRT_CHARS_PER_LINE = 16
-SRT_MAX_LINES = 2
+SRT_CHARS_PER_LINE = 32
+SRT_MAX_LINES = 1
 _PRON_TAG_STRIP_RE = re.compile(r"<([^<>|]+)\|[^<>]+>")
 _CAPTION_PUNCT = "，。！？、；：,.!?;:"
 
@@ -2726,20 +2726,8 @@ def _caption_weight(text):
 
 
 def _layout_caption(text):
-    """Fit one caption into at most two on-screen lines."""
-    compact = re.sub(r"\s+", "", text or "").strip()
-    if not compact:
-        return ""
-    if len(compact) <= SRT_CHARS_PER_LINE:
-        return compact
-    window = compact[:SRT_CHARS_PER_LINE]
-    best = -1
-    for i, ch in enumerate(window):
-        if ch in _CAPTION_PUNCT:
-            best = i
-    if best >= max(4, SRT_CHARS_PER_LINE // 3):
-        return compact[: best + 1] + "\n" + compact[best + 1 :]
-    return compact[:SRT_CHARS_PER_LINE] + "\n" + compact[SRT_CHARS_PER_LINE:]
+    """One on-screen cue is a single line (no mid-cue wrap)."""
+    return re.sub(r"\s+", "", text or "").strip()
 
 
 def _hard_wrap_caption(text, max_chars):
@@ -2747,7 +2735,7 @@ def _hard_wrap_caption(text, max_chars):
     if not compact:
         return []
     return [
-        _layout_caption(compact[i:i + max_chars])
+        compact[i:i + max_chars]
         for i in range(0, len(compact), max_chars)
     ]
 
@@ -2756,7 +2744,7 @@ def split_zh_captions(text, max_chars=None):
     """Split spoken Chinese into short on-screen captions.
 
     TTS keeps the full sentence; only the exported SRT is sliced.
-    Each caption is at most two lines of ``SRT_CHARS_PER_LINE`` characters.
+    Each caption is a single line of at most ``SRT_CHARS_PER_LINE`` characters.
     """
     max_chars = max_chars or (SRT_CHARS_PER_LINE * SRT_MAX_LINES)
     text = _strip_pron_tags(text).strip()
@@ -2810,7 +2798,7 @@ def generate_srt(segments, output_path, lang="zh"):
     """Generate SRT subtitle file aligned to actual dubbed audio timing.
 
     Uses new_start (shifted timeline) and aligned_duration (post-stretch).
-    Chinese cues are split so each screen shows at most two short lines.
+    Chinese cues are split into sequential single-line captions (no wrap).
     """
     text_key = "zh_text" if lang == "zh" else "text"
     with open(output_path, "w", encoding="utf-8") as f:
