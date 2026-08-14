@@ -31,6 +31,9 @@ uv run intent_pipeline.py video.mp4 --intent "分析演讲技巧" --ref-audio vo
 uv run intent_pipeline.py video.mp4 --intent "提炼职场法则" --ref-audio voice.wav --orientation landscape
 uv run intent_pipeline.py --batch /path/to/videos --intent "..." --ref-audio voice.wav -o /output
 
+# Novel to audiobook (per-chapter multi-speaker WAV)
+PYTHONPATH="$PYTHONPATH:." uv run novel_pipeline.py novel.txt --ref-audio voice.wav -o audiobook_out
+
 # Run scripts (must use uv run, may need PYTHONPATH)
 PYTHONPATH="$PYTHONPATH:." uv run <script.py>
 
@@ -73,6 +76,7 @@ Input Text + Reference Audio
 - `dub_pipeline.py` — Video dubbing pipeline (English → Chinese, WhisperX + LLM translation + IndexTTS2)
 - `highlight_pipeline.py` — Video highlight pipeline (long video → Douyin short, Qwen2.5-VL + LLM + IndexTTS2)
 - `intent_pipeline.py` — Intent-driven video pipeline (video + intent → structured content, 18 fancy text effects, emotion profiling)
+- `novel_pipeline.py` — Novel-to-audiobook pipeline (TXT → style/characters → 2.5 voice cards → reading script → per-chapter WAV)
 - `checkpoints/` — Model weights, config.yaml, bpe.model, emotion/speaker matrices
 
 ### Platform-specific text processing
@@ -120,6 +124,14 @@ English Video → demucs source separation → WhisperX ASR + pyannote diarizati
 ```
 
 Requires: `HF_TOKEN` and `LLM_API_KEY` env vars.
+
+### Novel pipeline architecture
+
+```
+小说 TXT → 风格/人物 → 2.5 声卡 → 朗读句 → 按章 WAV
+```
+
+Work dir `{work_dir}/{stem}/` holds source/chapters/style/characters/script/voices/tts/checkpoint. LLM required from style onward; `--stop-after chapters` does not. TTS loads only at voices/tts. `--chapter N` and `--force-tts` rebuild a single chapter; `--concat-book` is optional.
 
 ## Key conventions
 

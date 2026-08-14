@@ -15,6 +15,7 @@ from novel_pipeline import (
     merge_chapter,
     merge_character_lists,
     prepare_tts_text,
+    run_novel_pipeline,
     split_chapters,
     split_utterances,
     synthesize_chapter,
@@ -257,5 +258,34 @@ def test_merge_chapter_inserts_silence(tmp_path):
     )
     with wave.open(str(out)) as w:
         assert w.getnframes() == 2205 + 22050 + 2205
+
+
+def test_run_pipeline_stop_after_chapters(tmp_path):
+    src = tmp_path / "book.txt"
+    src.write_text("第一章 一\n你好。\n第二章 二\n再见。\n", encoding="utf-8")
+    result = run_novel_pipeline(
+        input_path=str(src),
+        output=str(tmp_path / "out"),
+        work_dir=str(tmp_path / "ws"),
+        stop_after="chapters",
+        llm_api_key="dummy",
+    )
+    assert result["step"] == 1
+    assert (tmp_path / "ws" / "book" / "chapters.json").is_file()
+
+
+def test_cli_requires_llm_for_full_run(monkeypatch):
+    from novel_pipeline import build_parser, main
+
+    help_text = build_parser().format_help()
+    assert "--ref-mode" in help_text
+
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    try:
+        main(["book.txt", "-o", "out"])
+    except SystemExit as exc:
+        assert exc.code not in (0, None)
+    else:
+        raise AssertionError("full run without LLM key should exit")
 
 

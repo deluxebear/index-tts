@@ -7,11 +7,14 @@ Task 3 adds LLM style/character analysis and validation helpers.
 Task 4 adds seed voice bank matching and IndexTTS-2.5 character voice cards.
 Task 5 builds per-chapter reading scripts (speaker, emotion, glossary, silence).
 Task 6 synthesizes lines in order and merges chapter WAVs.
+Task 7 orchestrates steps with checkpoint resume and a CLI.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
 import shutil
 import wave
@@ -25,7 +28,15 @@ from dub_pipeline import (
     estimate_emotion_from_text,
     load_pronunciation_glossary,
 )
-from highlight_pipeline import LLMClient, _parse_json_response  # noqa: F401
+from highlight_pipeline import (
+    LLMClient,
+    _clear_checkpoint,
+    _free_vram,
+    _init_tts,
+    _load_checkpoint,
+    _parse_json_response,
+    _save_checkpoint,
+)
 
 # Chinese chapter headings: 第N章 / 第N节 / 第N回 / 第N卷
 CHAPTER_RE = re.compile(
@@ -1483,4 +1494,575 @@ def synthesize_chapter(
 def merge_chapter(utterances: list[dict], output_path: str) -> str:
     """Concatenate utterance WAVs with per-line ``silence_after_ms`` via ``_concat_wavs``."""
     return _concat_wavs(list(utterances or []), output_path)
+
+
+# ---------------------------------------------------------------------------
+# Task 7: orchestration, checkpoint resume, CLI
+# ---------------------------------------------------------------------------
+
+_STOP_AFTER_STEPS = {
+    "chapters": 1,
+    "style": 2,
+    "characters": 3,
+    "voices": 4,
+    "script": 5,
+    "tts": 6,
+    "merge": 7,
+}
+_DEFAULT_WORK_DIR = "novel_workspace"
+_DEFAULT_VOICE_BANK = "examples/voice_bank.yaml"
+_BOOK_CHAPTER_GAP_MS = 1500
+
+
+def _write_json(path: str | Path, data: Any) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _read_json(path: str | Path) -> Any:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_novel_checkpoint(novel_dir: str | Path, step: int, paths: dict | None = None) -> None:
+    """Wrap highlight ``_save_checkpoint`` so novel state is ``{step, paths}``."""
+    _save_checkpoint(str(novel_dir), int(step), paths=paths or {})
+
+
+def _strip_markdown_hashes(text: str) -> str:
+    """Drop Markdown heading markers but keep the title text."""
+    return re.sub(r"(?m)^#{1,6}\s*", "", text)
+
+
+def _target_step(stop_after: str | None) -> int:
+    if not stop_after:
+        return 7
+    key = str(stop_after).strip().lower()
+    if key not in _STOP_AFTER_STEPS:
+        raise ValueError(
+            f"invalid stop_after={stop_after!r}; "
+            f"expected one of {sorted(_STOP_AFTER_STEPS)}"
+        )
+    return _STOP_AFTER_STEPS[key]
+
+
+def _require_llm_key(llm_api_key: str | None, target: int) -> str | None:
+    if target < 2:
+        return llm_api_key
+    key = llm_api_key or os.environ.get("LLM_API_KEY")
+    if not key:
+        raise ValueError(
+            "LLM API key required from style onward. "
+            "Use --llm-api-key or set LLM_API_KEY."
+        )
+    return key
+
+
+def _default_paths(novel_dir: Path) -> dict[str, str]:
+    return {
+        "source": str(novel_dir / "source.txt"),
+        "chapters": str(novel_dir / "chapters.json"),
+        "style": str(novel_dir / "style.json"),
+        "characters": str(novel_dir / "characters.json"),
+        "script": str(novel_dir / "script"),
+        "voices": str(novel_dir / "voices"),
+        "tts": str(novel_dir / "tts"),
+        "chapters_audio": str(novel_dir / "chapters"),
+    }
+
+
+def _filter_chapters(chapters: list[dict], chapter: int | None) -> list[dict]:
+    if chapter is None:
+        return list(chapters)
+    n = int(chapter)
+    cid = f"c{n:02d}"
+    selected = [
+        c
+        for c in chapters
+        if int(c.get("index") or 0) == n or c.get("id") == cid
+    ]
+    if not selected:
+        raise ValueError(f"chapter {chapter} not found")
+    return selected
+
+
+def _resolve_voice_bank(voice_bank: str | None) -> list[dict]:
+    p = Path(voice_bank) if voice_bank else Path(_DEFAULT_VOICE_BANK)
+    if p.is_dir():
+        yamls = sorted(p.glob("*.yaml")) + sorted(p.glob("*.yml"))
+        if not yamls:
+            return []
+        p = yamls[0]
+    if not p.is_file():
+        return []
+    bank = load_voice_bank(str(p))
+    base = p.parent
+    for entry in bank:
+        path = entry.get("path")
+        if not path:
+            continue
+        raw = Path(path)
+        if not raw.is_file():
+            alt = base / path
+            if alt.is_file():
+                entry["path"] = str(alt)
+    return bank
+
+
+def _all_scripts_exist(novel_dir: Path, chapters: list[dict]) -> bool:
+    script_dir = novel_dir / "script"
+    return bool(chapters) and all(
+        (script_dir / f"{c['id']}.json").is_file() for c in chapters
+    )
+
+
+def _ensure_wav_paths(utterances: list[dict], novel_dir: Path) -> list[dict]:
+    out: list[dict] = []
+    for raw in utterances:
+        utt = dict(raw)
+        if not utt.get("wav_path"):
+            cid = str(utt.get("chapter_id") or "c01")
+            try:
+                seq = int(utt.get("seq", 0))
+            except (TypeError, ValueError):
+                seq = 0
+            utt["wav_path"] = str(novel_dir / "tts" / cid / f"{seq:04d}.wav")
+        out.append(utt)
+    return out
+
+
+def _apply_style_voice_defaults(characters: list[dict], style: dict) -> list[dict]:
+    out: list[dict] = []
+    style_emo = style.get("base_emo") or [0.0] * _EMO_DIMS
+    style_df = style.get("duration_factor")
+    for raw in characters:
+        char = dict(raw)
+        if char.get("base_emo") is None:
+            char["base_emo"] = list(style_emo)
+        if char.get("duration_factor") is None and style_df is not None:
+            try:
+                char["duration_factor"] = _clamp(float(style_df), 0.5, 2.0)
+            except (TypeError, ValueError):
+                pass
+        out.append(char)
+    return out
+
+
+def _export_chapter_wavs(
+    chapter_wavs: list[tuple[str, str]],
+    output: str | None,
+    stem: str,
+    concat_book: bool,
+) -> list[str]:
+    """Copy chapter WAVs to ``--output`` and optionally concat ``book.wav``."""
+    if not chapter_wavs:
+        return []
+
+    dest = Path(output) if output else Path(f"{stem}_audiobook")
+    exported: list[str] = []
+
+    if dest.suffix.lower() == ".wav":
+        if len(chapter_wavs) == 1:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(chapter_wavs[0][1], dest)
+            exported.append(str(dest))
+            dest_dir = dest.parent
+        else:
+            dest_dir = dest.with_name(f"{stem}_chapters")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  Multi-chapter output file → directory {dest_dir}")
+            for cid, src in chapter_wavs:
+                target = dest_dir / f"{stem}_{cid}.wav"
+                shutil.copy2(src, target)
+                exported.append(str(target))
+    else:
+        dest_dir = dest
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for cid, src in chapter_wavs:
+            target = dest_dir / f"{stem}_{cid}.wav"
+            shutil.copy2(src, target)
+            exported.append(str(target))
+
+    print("  Output chapter WAVs:")
+    for path in exported:
+        print(f"    {path}")
+
+    if concat_book:
+        book_path = dest if dest.suffix.lower() == ".wav" and len(chapter_wavs) == 1 else dest_dir / "book.wav"
+        segs = [
+            {"wav_path": src, "silence_after_ms": _BOOK_CHAPTER_GAP_MS}
+            for _, src in chapter_wavs
+        ]
+        segs[-1]["silence_after_ms"] = 0
+        merge_chapter(segs, str(book_path))
+        print(f"  Concatenated book: {book_path}")
+        if str(book_path) not in exported:
+            exported.append(str(book_path))
+
+    return exported
+
+
+def run_novel_pipeline(
+    input_path: str,
+    output: str,
+    work_dir: str = _DEFAULT_WORK_DIR,
+    stop_after: str | None = None,
+    llm_api_key: str | None = None,
+    llm_api_base: str = "https://api.openai.com/v1",
+    llm_model: str = "gpt-4o-mini",
+    model_dir: str = "checkpoints",
+    use_fp16: bool = False,
+    ref_audio: str | None = None,
+    narrator_audio: str | None = None,
+    voice_bank: str | None = None,
+    ref_mode: str = "card",
+    lang: str | None = None,
+    chapter: int | None = None,
+    force_tts: bool = False,
+    strict: bool = False,
+    concat_book: bool = False,
+    cleanup: bool = False,
+) -> dict:
+    """
+    Run the novel-to-audiobook pipeline with file-backed resume.
+
+    Work dir is ``{work_dir}/{stem}/``. ``stop_after="chapters"`` writes
+    ``chapters.json`` and returns ``{"step": 1, ...}`` without loading TTS.
+    LLM key is required from style onward. TTS is loaded only at voices/tts.
+    """
+    src_path = Path(input_path)
+    if not src_path.is_file():
+        raise FileNotFoundError(f"input not found: {input_path}")
+
+    stem = src_path.stem
+    novel_dir = Path(work_dir) / stem
+    novel_dir.mkdir(parents=True, exist_ok=True)
+
+    target = _target_step(stop_after)
+    llm_api_key = _require_llm_key(llm_api_key, target)
+
+    ckpt = _load_checkpoint(str(novel_dir))
+    done = int((ckpt or {}).get("step") or 0)
+    paths = _default_paths(novel_dir)
+    paths.update((ckpt or {}).get("paths") or {})
+
+    source_path = Path(paths["source"])
+    chapters_path = Path(paths["chapters"])
+    style_path = Path(paths["style"])
+    characters_path = Path(paths["characters"])
+    script_dir = Path(paths["script"])
+    voices_dir = Path(paths["voices"])
+    tts_root = Path(paths["tts"])
+    chapters_audio_dir = Path(paths["chapters_audio"])
+
+    print(f"\n{'=' * 60}")
+    print("Novel Audiobook Pipeline")
+    print(f"Input:    {src_path}")
+    print(f"Output:   {output}")
+    print(f"Work dir: {novel_dir}")
+    print(f"{'=' * 60}")
+
+    text = ""
+    chapters: list[dict] = []
+    style: dict = {}
+    characters: list[dict] = []
+    llm: Any = None
+    tts: Any = None
+    result: dict = {"step": done, "paths": paths}
+
+    def ensure_llm() -> Any:
+        nonlocal llm
+        if llm is None:
+            llm = LLMClient(api_key=llm_api_key, api_base=llm_api_base, model=llm_model)
+        return llm
+
+    def ensure_tts() -> Any:
+        nonlocal tts
+        if tts is None:
+            print("  Loading IndexTTS-2.5...")
+            tts = _init_tts(model_dir, use_fp16)
+        return tts
+
+    def finish(step: int) -> dict:
+        result["step"] = step
+        result["paths"] = paths
+        return result
+
+    try:
+        # Step 0 ingest + Step 1 chapters
+        if done < 1 or not source_path.is_file() or not chapters_path.is_file():
+            print("\n[Step 0-1] Ingest and split chapters...")
+            raw = src_path.read_text(encoding="utf-8")
+            text = _strip_markdown_hashes(ingest_text(raw))
+            source_path.write_text(text, encoding="utf-8")
+            chapters = split_chapters(text, src_path.name)
+            _write_json(chapters_path, chapters)
+            paths["source"] = str(source_path)
+            paths["chapters"] = str(chapters_path)
+            done = 1
+            _save_novel_checkpoint(novel_dir, done, paths)
+            print(f"  {len(chapters)} chapter(s) → {chapters_path}")
+        else:
+            text = source_path.read_text(encoding="utf-8")
+            chapters = _read_json(chapters_path)
+            print(f"[Step 0-1] Skipped (cached, {len(chapters)} chapters)")
+
+        if target <= 1:
+            return finish(1)
+
+        # Step 2 style
+        if done < 2 or not style_path.is_file():
+            print("\n[Step 2] Analyzing style...")
+            style = analyze_style(text, chapters, ensure_llm())
+            if lang:
+                style = validate_style({**style, "lang": lang})
+            _write_json(style_path, style)
+            paths["style"] = str(style_path)
+            done = 2
+            _save_novel_checkpoint(novel_dir, done, paths)
+        else:
+            style = _read_json(style_path)
+            if lang:
+                style = validate_style({**style, "lang": lang})
+            print("[Step 2] Skipped (cached style)")
+
+        if target <= 2:
+            return finish(2)
+
+        # Step 3 characters
+        if done < 3 or not characters_path.is_file():
+            print("\n[Step 3] Extracting characters...")
+            characters = extract_characters(text, chapters, ensure_llm())
+            _write_json(characters_path, characters)
+            paths["characters"] = str(characters_path)
+            done = 3
+            _save_novel_checkpoint(novel_dir, done, paths)
+            print(f"  {len(characters)} character(s)")
+        else:
+            characters = _read_json(characters_path)
+            print(f"[Step 3] Skipped (cached, {len(characters)} characters)")
+
+        if target <= 3:
+            return finish(3)
+
+        selected = _filter_chapters(chapters, chapter)
+        style_lang = str((lang or style.get("lang") or "zh")).strip().lower() or "zh"
+
+        # Step 4 voice cards (load TTS)
+        manifest_path = voices_dir / "manifest.json"
+        if done < 4 or not manifest_path.is_file():
+            print("\n[Step 4] Assigning seeds and generating voice cards...")
+            bank = _resolve_voice_bank(voice_bank)
+            narr_src = narrator_audio or ref_audio
+            if not bank and not narr_src:
+                raise ValueError(
+                    "voice bank or --ref-audio/--narrator-audio is required "
+                    "to generate character voices"
+                )
+            characters = _apply_style_voice_defaults(characters, style)
+            characters = assign_seed_voices(characters, bank, narrator_audio=narr_src)
+            characters = generate_character_voices(
+                characters, ensure_tts(), str(novel_dir), style_lang, ref_mode,
+            )
+            _write_json(characters_path, characters)
+            paths["voices"] = str(voices_dir)
+            paths["characters"] = str(characters_path)
+            done = 4
+            _save_novel_checkpoint(novel_dir, done, paths)
+        else:
+            characters = _read_json(characters_path)
+            print("[Step 4] Skipped (cached voice cards)")
+
+        if target <= 4:
+            return finish(4)
+
+        # Step 5 per-chapter scripts (no TTS)
+        script_dir.mkdir(parents=True, exist_ok=True)
+        need_script = done < 5 or chapter is not None or not _all_scripts_exist(novel_dir, chapters)
+        if need_script:
+            print("\n[Step 5] Building chapter scripts...")
+            for ch in selected:
+                script_path = script_dir / f"{ch['id']}.json"
+                if script_path.is_file():
+                    print(f"  {ch['id']}: existing script")
+                    continue
+                body = text[int(ch.get("start_char") or 0) : int(ch.get("end_char") or 0)]
+                utts = build_chapter_script(
+                    body, ch["id"], characters, style, ensure_llm(), str(novel_dir),
+                )
+                _write_json(script_path, utts)
+                print(f"  {ch['id']}: {len(utts)} utterances")
+            if _all_scripts_exist(novel_dir, chapters):
+                done = 5
+                paths["script"] = str(script_dir)
+                _save_novel_checkpoint(novel_dir, done, paths)
+        else:
+            print("[Step 5] Skipped (cached scripts)")
+
+        if target <= 5:
+            return finish(5)
+
+        # Step 6 sequential TTS
+        if force_tts:
+            for ch in selected:
+                tdir = tts_root / ch["id"]
+                if tdir.is_dir():
+                    shutil.rmtree(tdir)
+                    print(f"  Removed {tdir} (--force-tts)")
+
+        need_tts = done < 6 or force_tts or chapter is not None
+        if need_tts:
+            print("\n[Step 6] Synthesizing chapter lines...")
+            for ch in selected:
+                script_path = script_dir / f"{ch['id']}.json"
+                utts = _read_json(script_path)
+                utts = synthesize_chapter(
+                    utts, characters, ensure_tts(), str(novel_dir), strict=strict,
+                )
+                _write_json(script_path, utts)
+                print(f"  {ch['id']}: {len(utts)} lines")
+            if chapter is None:
+                done = 6
+                paths["tts"] = str(tts_root)
+                _save_novel_checkpoint(novel_dir, done, paths)
+        else:
+            print("[Step 6] Skipped (cached TTS)")
+
+        if target <= 6:
+            return finish(6)
+
+        # Step 7 merge + export
+        print("\n[Step 7] Merging chapter WAVs...")
+        chapters_audio_dir.mkdir(parents=True, exist_ok=True)
+        merged: list[tuple[str, str]] = []
+        for ch in selected:
+            script_path = script_dir / f"{ch['id']}.json"
+            utts = _ensure_wav_paths(_read_json(script_path), novel_dir)
+            out_wav = chapters_audio_dir / f"{ch['id']}.wav"
+            merge_chapter(utts, str(out_wav))
+            merged.append((ch["id"], str(out_wav)))
+            print(f"  {out_wav}")
+
+        exported = _export_chapter_wavs(merged, output, stem, concat_book)
+        paths["chapters_audio"] = str(chapters_audio_dir)
+        paths["output"] = exported
+        result["output"] = exported
+        if chapter is None:
+            done = 7
+            _save_novel_checkpoint(novel_dir, done, paths)
+
+        if cleanup:
+            _clear_checkpoint(str(novel_dir))
+            shutil.rmtree(novel_dir, ignore_errors=True)
+            print(f"Cleaned up: {novel_dir}")
+
+        return finish(7)
+    finally:
+        if tts is not None:
+            del tts
+            _free_vram()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Turn a novel text file into a multi-speaker audiobook "
+            "(per-chapter WAV) via IndexTTS-2.5"
+        )
+    )
+    parser.add_argument("input", help="Input novel .txt or .md")
+    parser.add_argument(
+        "-o", "--output", default="audiobook_out",
+        help="Output directory or .wav file (directory lists {stem}_c01.wav)",
+    )
+    parser.add_argument(
+        "--work-dir", default=_DEFAULT_WORK_DIR,
+        help="Working directory (artifacts under {work_dir}/{stem}/)",
+    )
+    parser.add_argument("--model-dir", default="checkpoints", help="IndexTTS-2.5 model directory")
+    parser.add_argument(
+        "--fp16", action="store_true", default=True,
+        help="Use bf16 for TTS (default: True)",
+    )
+    parser.add_argument("--no-fp16", dest="fp16", action="store_false", help="Disable bf16")
+    parser.add_argument("--ref-audio", default=None, help="Narrator / fallback seed audio")
+    parser.add_argument("--narrator-audio", default=None, help="Override narrator seed audio")
+    parser.add_argument(
+        "--voice-bank", default=None,
+        help="voice_bank.yaml or a directory containing yaml + wav",
+    )
+    parser.add_argument(
+        "--ref-mode", choices=["card", "seed"], default="card",
+        help="card: synthesize 2.5 voice cards; seed: use seed wavs directly",
+    )
+    parser.add_argument("--lang", default=None, help="Override language (zh/en/ja/es/ar)")
+    parser.add_argument("--llm-api-key", default=None, help="LLM API key (or LLM_API_KEY env)")
+    parser.add_argument("--llm-api-base", default="https://api.openai.com/v1")
+    parser.add_argument("--llm-model", default="gpt-4o-mini")
+    parser.add_argument(
+        "--stop-after",
+        choices=["chapters", "style", "characters", "voices", "script", "tts", "merge"],
+        default=None,
+        help="Stop after this stage (chapters does not require an LLM key)",
+    )
+    parser.add_argument(
+        "--chapter", type=int, default=None,
+        help="Only process this 1-based chapter for script/tts/merge",
+    )
+    parser.add_argument(
+        "--force-tts", action="store_true",
+        help="Delete target chapter tts/ then resynthesize",
+    )
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="Abort on TTS failure instead of writing silence",
+    )
+    parser.add_argument(
+        "--concat-book", action="store_true",
+        help="Also write book.wav (1500 ms silence between chapters)",
+    )
+    parser.add_argument(
+        "--cleanup", action="store_true",
+        help="Delete work dir after success; keep --output chapter wavs",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    llm_key = args.llm_api_key or os.environ.get("LLM_API_KEY")
+    if args.stop_after not in {"chapters"} and not llm_key:
+        parser.error(
+            "LLM API key required for this run. "
+            "Use --llm-api-key or set LLM_API_KEY "
+            "(not required with --stop-after chapters)."
+        )
+    run_novel_pipeline(
+        input_path=args.input,
+        output=args.output,
+        work_dir=args.work_dir,
+        stop_after=args.stop_after,
+        llm_api_key=llm_key,
+        llm_api_base=args.llm_api_base,
+        llm_model=args.llm_model,
+        model_dir=args.model_dir,
+        use_fp16=args.fp16,
+        ref_audio=args.ref_audio,
+        narrator_audio=args.narrator_audio,
+        voice_bank=args.voice_bank,
+        ref_mode=args.ref_mode,
+        lang=args.lang,
+        chapter=args.chapter,
+        force_tts=args.force_tts,
+        strict=args.strict,
+        concat_book=args.concat_book,
+        cleanup=args.cleanup,
+    )
+
+
+if __name__ == "__main__":
+    main()
 
