@@ -54,6 +54,8 @@ def test_dubbing_notebook_uses_drive_work_dir():
     assert "跳过 Whisper" in text
     assert "{DRIVE_CACHE}/output/" in text
     assert "/content/{stem}_cn.mp4" not in text
+    assert "FORCE_UPLOAD" in text
+    assert "except Exception:" in text
 
 
 def test_voxcpm_notebook_cache_root_only():

@@ -32,3 +32,19 @@ def test_translation_keeps_successes_and_lists_failures():
     assert out[0]["zh_text"] == "你好"
     assert out[1].get("zh_text") in (None, "")
     assert untranslated_segment_ids(out) == [1]
+
+
+class _EnglishLLM:
+    def chat(self, prompt):
+        return "#0 Hello everyone\n#1 Thanks a lot"
+
+
+def test_english_looking_translation_is_rejected():
+    segs = [
+        {"text": "Hello world", "start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"},
+        {"text": "Thanks", "start": 1.0, "end": 2.0, "speaker": "SPEAKER_00"},
+    ]
+    out = translate_with_context(segs, {"topic": "t"}, _EnglishLLM(), batch_size=12)
+    assert out[0].get("zh_text") in (None, "")
+    assert out[1].get("zh_text") in (None, "")
+    assert untranslated_segment_ids(out) == [0, 1]

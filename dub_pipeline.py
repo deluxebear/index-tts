@@ -668,6 +668,9 @@ def find_loudest_window(audio_path, window_sec=SKIP_ASR_REF_SECONDS, ranges=None
     hop = max(1, int(hop_sec * sr))
     win = max(hop, int(float(window_sec) * sr))
     if win >= n:
+        if ranges:
+            a, b = max(ranges, key=lambda r: r[1] - r[0])
+            return float(max(0.0, a)), float(min(duration, b))
         return 0.0, duration
 
     n_hops = max(1, n // hop)
@@ -688,7 +691,7 @@ def find_loudest_window(audio_path, window_sec=SKIP_ASR_REF_SECONDS, ranges=None
     last = len(energy) - hops_per_win + 1
     for i in range(max(0, last)):
         inside = sum(1 for j in range(i, i + hops_per_win) if hop_ok(j))
-        if ranges and inside < hops_per_win * 0.4:
+        if ranges and inside < hops_per_win * 0.9:
             continue
         e = float(csum[i + hops_per_win] - csum[i])
         if e > best_e:
@@ -696,11 +699,19 @@ def find_loudest_window(audio_path, window_sec=SKIP_ASR_REF_SECONDS, ranges=None
             best_i = i
     if best_e < 0:
         if ranges:
-            a, b = ranges[0]
-            return float(a), float(min(duration, max(b, a + min(window_sec, duration))))
+            a, b = max(ranges, key=lambda r: r[1] - r[0])
+            return float(a), float(min(duration, b))
         return 0.0, min(float(window_sec), duration)
     start = best_i * hop / sr
     end = min(duration, start + win / sr)
+    if ranges:
+        # Never spill a reference clip into another speaker's time.
+        rs, re_ = min(r[0] for r in ranges), max(r[1] for r in ranges)
+        start = max(start, rs)
+        end = min(end, re_)
+        if end <= start:
+            a, b = max(ranges, key=lambda r: r[1] - r[0])
+            return float(a), float(min(duration, b))
     return float(start), float(end)
 
 
@@ -779,8 +790,12 @@ def extract_speaker_refs(segments, vocals_path, work_dir, fallback_refs=None):
         else:
             fallback = ref_path
 
-        # Pre-compute speaker embedding for voice consistency verification
-        embedding = _compute_speaker_embedding(ref_path)
+        embedding = None
+        if end - start >= 0.5:
+            try:
+                embedding = _compute_speaker_embedding(ref_path)
+            except Exception as e:
+                print(f"  Warning: embedding failed for {spk}: {e}")
 
         speaker_refs[spk] = {
             "fallback": fallback,
@@ -798,7 +813,10 @@ def _find_best_speaker(seg_embedding, speaker_refs):
     best_spk = None
     best_sim = -1.0
     for spk, info in speaker_refs.items():
-        sim = _cosine_similarity(seg_embedding, info["embedding"])
+        emb = info.get("embedding")
+        if emb is None:
+            continue
+        sim = _cosine_similarity(seg_embedding, emb)
         if sim > best_sim:
             best_sim = sim
             best_spk = spk
@@ -809,6 +827,9 @@ def get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir):
     """Select reference audio with speaker embedding verification for short segments."""
     duration = seg["end"] - seg["start"]
     spk = seg.get("speaker", "UNKNOWN")
+    info = speaker_refs.get(spk) or next(iter(speaker_refs.values()), None)
+    if not info:
+        raise KeyError(f"no speaker reference for {spk}")
 
     if duration >= MIN_REF_DURATION:
         seg_ref = os.path.join(seg_ref_dir, f"seg_{seg['start']:.2f}_{seg['end']:.2f}.wav")
@@ -816,16 +837,19 @@ def get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir):
             extract_audio_segment(vocals_path, seg["start"], seg["end"], seg_ref)
         return seg_ref
 
+    if duration < 0.5 or info.get("embedding") is None:
+        return info["fallback"]
+
     # Short segment: verify voice matches assigned speaker via embedding
     seg_ref = os.path.join(seg_ref_dir, f"seg_{seg['start']:.2f}_{seg['end']:.2f}.wav")
     if not os.path.exists(seg_ref):
         extract_audio_segment(vocals_path, seg["start"], seg["end"], seg_ref)
 
     seg_embedding = _compute_speaker_embedding(seg_ref)
-    assigned_sim = _cosine_similarity(seg_embedding, speaker_refs[spk]["embedding"])
+    assigned_sim = _cosine_similarity(seg_embedding, info["embedding"])
 
     if assigned_sim >= SPEAKER_SIM_THRESHOLD:
-        return speaker_refs[spk]["fallback"]
+        return info["fallback"]
 
     # Diarization likely wrong — find the best matching speaker
     best_spk, best_sim = _find_best_speaker(seg_embedding, speaker_refs)
@@ -835,7 +859,7 @@ def get_ref_for_segment(seg, speaker_refs, vocals_path, seg_ref_dir):
         seg["speaker"] = best_spk  # correct the label for downstream use
         return speaker_refs[best_spk]["fallback"]
 
-    return speaker_refs[spk]["fallback"]
+    return info["fallback"]
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1099,8 @@ def translate_with_context(segments, context, llm_client, batch_size=12,
             still_pending = []
             for idx, seg in pending:
                 zh_text = parsed.get(idx)
+                if zh_text is not None and _looks_like_untranslated_english(zh_text):
+                    zh_text = None
                 if zh_text is not None:
                     zh_text = normalize_spoken_datetime(zh_text)
                     seg["zh_text"] = zh_text
@@ -1123,7 +1149,22 @@ def _split_zh_and_emotion(rest):
         vec = _parse_emo_vector(right)
         if vec is not None:
             return left.strip(), vec
+        return left.strip(), None
     return rest.strip(), None
+
+
+def _looks_like_untranslated_english(text):
+    """True when a 'translation' is still basically English and should be retried."""
+    if not text:
+        return False
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return False
+    cjk = sum(1 for c in chars if "\u4e00" <= c <= "\u9fff")
+    if cjk >= 2:
+        return False
+    letters = sum(1 for c in chars if ("A" <= c <= "Z") or ("a" <= c <= "z"))
+    return letters >= 4 and letters / len(chars) >= 0.35
 
 
 def _parse_translation_response(response):
@@ -1744,7 +1785,7 @@ def assign_speakers_to_cues(cues, vocals_path=None, num_speakers=None, hf_token=
         if name not in unique:
             unique.append(name)
 
-    enough = len(labeled) >= max(1, int(len(cues) * 0.3)) if cues else False
+    enough = subtitle_has_usable_speaker_labels(cues)
     if enough and unique:
         mapping = {name: f"SPEAKER_{i:02d}" for i, name in enumerate(unique)}
         default = mapping[unique[0]]
@@ -1764,6 +1805,71 @@ def assign_speakers_to_cues(cues, vocals_path=None, num_speakers=None, hf_token=
     for cue in cues:
         cue["speaker"] = _speaker_from_turns(cue, turns) or "SPEAKER_00"
     return cues
+
+
+def _join_caption_text(left, right):
+    a = (left or "").strip()
+    b = (right or "").strip()
+    if not a:
+        return b
+    if not b or b == a:
+        return a
+    if re.search(r"[\u4e00-\u9fff]", a) or re.search(r"[\u4e00-\u9fff]", b):
+        return a + b
+    return f"{a} {b}"
+
+
+def deoverlap_same_speaker_segments(segments):
+    """Merge overlapping cues from the same speaker so TTS does not double-speak.
+
+    Different speakers that overlap (crosstalk) are left as separate mix units.
+    """
+    if not segments:
+        return segments
+    ordered = sorted((dict(s) for s in segments), key=lambda s: (s["start"], s["end"]))
+    merged = []
+    for seg in ordered:
+        if not merged:
+            merged.append(seg)
+            continue
+        prev = merged[-1]
+        same = prev.get("speaker") == seg.get("speaker")
+        if same and seg["start"] < prev["end"]:
+            prev["end"] = max(prev["end"], seg["end"])
+            if "end_padded" in prev or "end_padded" in seg:
+                prev["end_padded"] = max(
+                    prev.get("end_padded", prev["end"]),
+                    seg.get("end_padded", seg["end"]),
+                )
+            prev["text"] = _join_caption_text(prev.get("text"), seg.get("text"))
+            if prev.get("zh_text") or seg.get("zh_text"):
+                prev["zh_text"] = _join_caption_text(prev.get("zh_text"), seg.get("zh_text"))
+            continue
+        merged.append(seg)
+    if len(merged) != len(segments):
+        print(f"  Merged {len(segments) - len(merged)} same-speaker overlapping cues "
+              f"({len(segments)} → {len(merged)})")
+    return merged
+
+
+def subtitle_has_usable_speaker_labels(cues):
+    """True when enough cues carry a speaker/role label for skip-ASR assignment."""
+    if not cues:
+        return False
+    labeled = [c.get("speaker_label") for c in cues if c.get("speaker_label")]
+    return len(labeled) >= max(1, int(len(cues) * 0.3))
+
+
+def translation_needs_llm(video_path, no_external_subs=False, external_subs=None):
+    """False when cleaned Chinese (or converted Traditional) subs can fill zh_text."""
+    if no_external_subs:
+        return True
+    cues, _, lang_hint = load_cleaned_subtitle_cues(
+        video_path, external_subs=external_subs, quiet=True,
+    )
+    if not cues:
+        return True
+    return lang_hint == "en"
 
 
 def cues_to_segments(cues, lang_hint):
@@ -1808,7 +1914,7 @@ def build_segments_from_subtitles(
         cues, vocals_path=vocals_path, num_speakers=num_speakers, hf_token=hf_token,
     )
     text_lang = "en" if lang_hint == "en" else "zh"
-    segments = cues_to_segments(cues, text_lang)
+    segments = deoverlap_same_speaker_segments(cues_to_segments(cues, text_lang))
     print(f"  Subtitle-driven ({text_lang}): {len(segments)} cues, Whisper skipped")
     return segments, f"{source_desc}:{Path(sub_path).name}"
 
@@ -1934,6 +2040,7 @@ def build_subtitle_driven_segments(video_path, asr_segments, external_subs=None)
                 "speaker": spk or default_spk,
             })
 
+    segments = deoverlap_same_speaker_segments(segments)
     if is_english:
         print(f"  Subtitle-driven (EN): {len(segments)} cleaned cues will be LLM-translated "
               f"(ASR had {len(asr_segments)} segments)")
@@ -2283,6 +2390,10 @@ def _build_video_with_slowdowns(video_only_path, timeline, video_duration, outpu
     raw_entries = []
     prev_end = 0.0
     for (orig_start, orig_end, _, _, slowdown) in timeline:
+        if orig_start < prev_end:
+            orig_start = prev_end
+        if orig_start >= orig_end:
+            continue
         if orig_start > prev_end + 0.01:
             raw_entries.append((prev_end, orig_start, 1.0))
         raw_entries.append((orig_start, orig_end, slowdown if slowdown > 1.01 else 1.0))
@@ -2786,12 +2897,13 @@ def redub_segments(
     model_dir="checkpoints",
     use_fp16=True,
     tts=None,
-    audio_only_align=True,
+    audio_only_align=None,
 ):
     """Re-TTS selected sentence ids and remux, using checkpoint artifacts.
 
     ``texts`` is an optional ``{id: new_zh_text}`` map (supports
     ``<行|HANG2>`` / ``<word|CMU PHONEMES>``). Omitted ids keep existing zh_text.
+    ``audio_only_align`` defaults to the value stored in the checkpoint.
     """
     video_path = str(video_path)
     video_work_dir, ckpt = _load_work_state(work_dir, video_path)
@@ -2842,6 +2954,9 @@ def redub_segments(
     segments = generate_speech(segments, speaker_refs, vocals_path, video_work_dir, tts)
     _save_checkpoint(video_work_dir, 7, segments=segments, paths=paths)
 
+    if audio_only_align is None:
+        audio_only_align = bool(paths.get("audio_only_align", ckpt.get("audio_only_align", True)))
+
     print("[redub] Aligning durations...")
     segments = align_durations(segments, video_work_dir, audio_only_align=audio_only_align)
     _save_checkpoint(video_work_dir, 8, segments=segments, paths=paths)
@@ -2850,9 +2965,22 @@ def redub_segments(
         stem = Path(video_path).stem
         output_path = str(Path(video_path).parent / f"{stem}_cn.mp4")
 
+    timeline = None
+    new_total = None
+    if not audio_only_align and any(seg.get("video_slowdown", 1.0) > 1.01 for seg in segments):
+        print("[redub] Recomputing shifted timeline...")
+        video_duration = _get_video_duration(video_only_path)
+        timeline, new_total = compute_shifted_timeline(segments, video_duration)
+
     print("[redub] Assembling video...")
-    assemble_final(segments, bg_path, video_only_path, output_path, video_work_dir)
-    _save_checkpoint(video_work_dir, 10, segments=segments, paths=paths)
+    assemble_final(
+        segments, bg_path, video_only_path, output_path, video_work_dir,
+        timeline=timeline, new_total_duration=new_total,
+    )
+    _save_checkpoint(
+        video_work_dir, 10, segments=segments, paths=paths,
+        timeline=timeline, new_total=new_total,
+    )
 
     srt_base = output_path.rsplit(".", 1)[0]
     generate_srt(segments, f"{srt_base}.srt", lang="zh")
@@ -2936,6 +3064,7 @@ def dub_video(
     done = ckpt["step"] if ckpt else 0
     segments = ckpt.get("segments") if ckpt else None
     paths = ckpt.get("paths", {}) if ckpt else {}
+    paths["audio_only_align"] = audio_only_align
 
     # Free GPU for demucs/whisperx steps (TTS not needed until Step 6)
     if done < 7:
@@ -3001,7 +3130,7 @@ def dub_video(
     # --- Step 3.5: Gap absorption ---
     if done < 4:
         print("\n[Step 3.5/11] Absorbing inter-segment gaps...")
-        segments = absorb_gaps(segments)
+        segments = deoverlap_same_speaker_segments(absorb_gaps(segments))
         _save_checkpoint(video_work_dir, 4, segments=segments, paths=paths)
     else:
         print(f"\n[Step 3.5/11] Skipped (cached)")
@@ -3036,6 +3165,7 @@ def dub_video(
             )
             if sub_segments is not None:
                 segments = absorb_gaps(sub_segments)  # rebuild end_padded for cue units
+                segments = deoverlap_same_speaker_segments(segments)
                 print(f"  Using subtitle-driven segments ({sub_source})")
 
         untranslated = sum(1 for s in segments if not s.get("zh_text") and s.get("text", "").strip())
@@ -3118,8 +3248,12 @@ def dub_video(
             seg["new_start"] = seg["start"]
 
     # --- Step 8-9: Assembly ---
-    if done < 10:
-        print("\n[Step 8-9/11] Assembling final video...")
+    output_ready = os.path.isfile(output_path)
+    if done < 10 or not output_ready:
+        if done >= 10 and not output_ready:
+            print("\n[Step 8-9/11] Output missing; reassembling from cached audio...")
+        else:
+            print("\n[Step 8-9/11] Assembling final video...")
         assemble_final(segments, bg_path, video_only_path, output_path, video_work_dir,
                        timeline=timeline, new_total_duration=new_total)
         _save_checkpoint(video_work_dir, 10, segments=segments, paths=paths)
@@ -3317,7 +3451,6 @@ def main():
             work_dir=args.work_dir,
             model_dir=args.model_dir,
             use_fp16=use_fp16,
-            audio_only_align=True,
         )
         return
 
@@ -3325,12 +3458,34 @@ def main():
     llm_api_key = args.llm_api_key or os.environ.get("LLM_API_KEY")
     use_fp16 = args.fp16 and not args.no_fp16
 
-    needs_diarization = args.num_speakers is None or args.num_speakers != 1
+    peek_cues = []
+    if not args.batch and not args.no_external_subs:
+        peek_cues, _, _ = load_cleaned_subtitle_cues(
+            args.input, external_subs=args.external_subs, quiet=True,
+        )
+    has_labels = subtitle_has_usable_speaker_labels(peek_cues)
+    skip_asr = bool(peek_cues)
+    if args.batch:
+        needs_diarization = args.num_speakers is None or args.num_speakers != 1
+    elif args.num_speakers == 1 or (skip_asr and has_labels):
+        needs_diarization = False
+    else:
+        needs_diarization = True
+
     if needs_diarization and not hf_token:
-        print("Error: HuggingFace token required for diarization. Use --hf-token or set HF_TOKEN, or pass --num-speakers 1.")
+        print("Error: HuggingFace token required for diarization. Use --hf-token or set HF_TOKEN, "
+              "or pass --num-speakers 1, or provide speaker-labeled subtitles.")
         sys.exit(1)
-    if not llm_api_key:
-        print("Error: LLM API key required. Use --llm-api-key or set LLM_API_KEY env var.")
+
+    needs_llm = True
+    if not args.batch:
+        needs_llm = translation_needs_llm(
+            args.input, no_external_subs=args.no_external_subs,
+            external_subs=args.external_subs,
+        )
+    if needs_llm and not llm_api_key:
+        print("Error: LLM API key required for translation. Use --llm-api-key or set LLM_API_KEY "
+              "(not needed when using complete Chinese subtitles).")
         sys.exit(1)
 
     common_kwargs = dict(
