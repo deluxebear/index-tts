@@ -2515,26 +2515,136 @@ def _format_srt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+SRT_CHARS_PER_LINE = 16
+SRT_MAX_LINES = 2
+_PRON_TAG_STRIP_RE = re.compile(r"<([^<>|]+)\|[^<>]+>")
+_CAPTION_PUNCT = "，。！？、；：,.!?;:"
+
+
+def _strip_pron_tags(text):
+    return _PRON_TAG_STRIP_RE.sub(r"\1", text or "")
+
+
+def _display_len(text):
+    return len(re.sub(r"\s+", "", text or ""))
+
+
+def _caption_weight(text):
+    n = len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", text or ""))
+    return max(1, n)
+
+
+def _layout_caption(text):
+    """Fit one caption into at most two on-screen lines."""
+    compact = re.sub(r"\s+", "", text or "").strip()
+    if not compact:
+        return ""
+    if len(compact) <= SRT_CHARS_PER_LINE:
+        return compact
+    window = compact[:SRT_CHARS_PER_LINE]
+    best = -1
+    for i, ch in enumerate(window):
+        if ch in _CAPTION_PUNCT:
+            best = i
+    if best >= max(4, SRT_CHARS_PER_LINE // 3):
+        return compact[: best + 1] + "\n" + compact[best + 1 :]
+    return compact[:SRT_CHARS_PER_LINE] + "\n" + compact[SRT_CHARS_PER_LINE:]
+
+
+def _hard_wrap_caption(text, max_chars):
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return []
+    return [
+        _layout_caption(compact[i:i + max_chars])
+        for i in range(0, len(compact), max_chars)
+    ]
+
+
+def split_zh_captions(text, max_chars=None):
+    """Split spoken Chinese into short on-screen captions.
+
+    TTS keeps the full sentence; only the exported SRT is sliced.
+    Each caption is at most two lines of ``SRT_CHARS_PER_LINE`` characters.
+    """
+    max_chars = max_chars or (SRT_CHARS_PER_LINE * SRT_MAX_LINES)
+    text = _strip_pron_tags(text).strip()
+    if not text:
+        return []
+
+    units = [p.strip() for p in re.split(rf"(?<=[{re.escape(_CAPTION_PUNCT)}])", text) if p.strip()]
+    if not units:
+        units = [text]
+
+    captions = []
+    current = ""
+    for unit in units:
+        if _display_len(unit) > max_chars:
+            if current:
+                captions.append(_layout_caption(current))
+                current = ""
+            captions.extend(_hard_wrap_caption(unit, max_chars))
+            continue
+        trial = current + unit
+        if current and _display_len(trial) > max_chars:
+            captions.append(_layout_caption(current))
+            current = unit
+        else:
+            current = trial
+    if current:
+        captions.append(_layout_caption(current))
+    return [c for c in captions if c]
+
+
+def _caption_spans(captions, start, end):
+    """Spread captions across [start, end] by readable-character weight."""
+    if not captions:
+        return []
+    weights = [_caption_weight(c) for c in captions]
+    total_w = sum(weights) or 1
+    dur = max(0.0, float(end) - float(start))
+    t = float(start)
+    spans = []
+    for i, (cap, weight) in enumerate(zip(captions, weights)):
+        if i == len(captions) - 1:
+            spans.append((t, float(end), cap))
+        else:
+            piece = dur * (weight / total_w)
+            spans.append((t, t + piece, cap))
+            t += piece
+    return spans
+
+
 def generate_srt(segments, output_path, lang="zh"):
     """Generate SRT subtitle file aligned to actual dubbed audio timing.
 
     Uses new_start (shifted timeline) and aligned_duration (post-stretch).
+    Chinese cues are split so each screen shows at most two short lines.
     """
     text_key = "zh_text" if lang == "zh" else "text"
     with open(output_path, "w", encoding="utf-8") as f:
         idx = 0
         for seg in segments:
-            text = seg.get(text_key, "")
+            text = seg.get(text_key, "") or ""
             if not text.strip():
                 continue
-            idx += 1
             srt_start = seg.get("new_start", seg["start"])
             aligned_dur = seg.get("aligned_duration")
             if aligned_dur is not None:
                 srt_end = srt_start + aligned_dur
             else:
                 srt_end = srt_start + (seg["end"] - seg["start"])
-            f.write(f"{idx}\n{_format_srt_time(srt_start)} --> {_format_srt_time(srt_end)}\n{text}\n\n")
+            if lang == "zh":
+                pieces = _caption_spans(split_zh_captions(text), srt_start, srt_end)
+            else:
+                pieces = [(srt_start, srt_end, text.strip())]
+            for a, b, cap in pieces:
+                if not cap:
+                    continue
+                idx += 1
+                f.write(
+                    f"{idx}\n{_format_srt_time(a)} --> {_format_srt_time(b)}\n{cap}\n\n"
+                )
     print(f"  Saved SRT: {output_path}")
 
 
