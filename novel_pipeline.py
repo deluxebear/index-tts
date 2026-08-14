@@ -3,7 +3,8 @@ Novel audiobook pipeline: novel text → multi-speaker chapter WAVs via IndexTTS
 
 Task 1 provides text ingest, chapter splitting, and silent WAV concatenation.
 Task 2 adds dialogue/narration split and IndexTTS 2.5 sentence-length limits.
-Later steps add LLM analysis, voice cards, and TTS.
+Task 3 adds LLM style/character analysis and validation helpers.
+Later steps add voice cards and TTS.
 """
 
 from __future__ import annotations
@@ -11,6 +12,9 @@ from __future__ import annotations
 import re
 import wave
 from pathlib import Path
+from typing import Any
+
+from highlight_pipeline import LLMClient, _parse_json_response  # noqa: F401
 
 # Chinese chapter headings: 第N章 / 第N节 / 第N回 / 第N卷
 CHAPTER_RE = re.compile(
@@ -335,3 +339,393 @@ def _concat_wavs(segments: list[dict], output_path: str) -> str:
                 )
 
     return str(out)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: style / character LLM analysis and validation
+# ---------------------------------------------------------------------------
+
+_VALID_LANGS = frozenset({"zh", "en", "ja", "es", "ar"})
+_STYLE_DURATION_MIN = 0.8
+_STYLE_DURATION_MAX = 1.3
+_EMO_DIMS = 8
+_DEFAULT_NARRATOR = {
+    "id": "narrator",
+    "name": "旁白",
+    "aliases": [],
+    "role": "narrator",
+    "gender": "male",
+    "age": "middle",
+    "personality": "沉稳",
+    "voice_traits": "低沉",
+}
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _normalize_base_emo(raw: Any) -> list[float]:
+    """Pad/truncate to 8 floats clamped to [0, 1]."""
+    if raw is None:
+        values: list[Any] = []
+    elif isinstance(raw, (list, tuple)):
+        values = list(raw)
+    else:
+        values = []
+    out: list[float] = []
+    for i in range(_EMO_DIMS):
+        if i < len(values):
+            try:
+                v = float(values[i])
+            except (TypeError, ValueError):
+                v = 0.0
+            out.append(_clamp(v, 0.0, 1.0))
+        else:
+            out.append(0.0)
+    return out
+
+
+def validate_style(data: dict) -> dict:
+    """
+    Normalize and clamp a style analysis dict.
+
+    lang → lowercase in {zh,en,ja,es,ar} (default zh);
+    duration_factor → clamp 0.8–1.3;
+    base_emo → 8 floats in [0,1].
+    """
+    if not isinstance(data, dict):
+        data = {}
+    out = dict(data)
+
+    lang = str(out.get("lang") or "zh").strip().lower()
+    # Accept prefixes like "zh-CN"
+    if lang not in _VALID_LANGS:
+        for code in _VALID_LANGS:
+            if lang.startswith(code):
+                lang = code
+                break
+        else:
+            lang = "zh"
+    out["lang"] = lang
+
+    try:
+        df = float(out.get("duration_factor", 1.0))
+    except (TypeError, ValueError):
+        df = 1.0
+    out["duration_factor"] = _clamp(df, _STYLE_DURATION_MIN, _STYLE_DURATION_MAX)
+    out["base_emo"] = _normalize_base_emo(out.get("base_emo"))
+
+    for key in (
+        "title",
+        "genre",
+        "narrative_pov",
+        "era",
+        "tone",
+        "pacing",
+        "narrator_style",
+    ):
+        if key not in out or out[key] is None:
+            out[key] = ""
+        else:
+            out[key] = str(out[key])
+    return out
+
+
+def validate_character(data: dict) -> dict:
+    """
+    Normalize a single character record.
+
+    Ensures id/name/aliases/role/gender/age/personality/voice_traits and
+    optional duration_factor / base_emo when present.
+    """
+    if not isinstance(data, dict):
+        data = {}
+    out = dict(data)
+
+    name = str(out.get("name") or "").strip() or "unknown"
+    out["name"] = name
+
+    cid = str(out.get("id") or "").strip()
+    if not cid:
+        # slug from name: keep alnum / underscore; Chinese kept as-is for readability
+        slug = re.sub(r"\s+", "_", name)
+        slug = re.sub(r"[^\w\u4e00-\u9fff-]", "", slug) or "char"
+        cid = slug
+    out["id"] = cid
+
+    aliases = out.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    cleaned_aliases: list[str] = []
+    seen_a: set[str] = set()
+    for a in aliases:
+        a_s = str(a).strip()
+        if a_s and a_s != name and a_s not in seen_a:
+            seen_a.add(a_s)
+            cleaned_aliases.append(a_s)
+    out["aliases"] = cleaned_aliases
+
+    role = str(out.get("role") or "dialogue").strip().lower()
+    if role not in {"narrator", "dialogue", "crowd"}:
+        role = "dialogue"
+    if cid == "narrator" or name in {"旁白", "narrator", "Narrator"}:
+        role = "narrator"
+        out["id"] = "narrator"
+        if not name or name == "unknown":
+            out["name"] = "旁白"
+    out["role"] = role
+
+    out["gender"] = str(out.get("gender") or "unknown").strip().lower() or "unknown"
+    out["age"] = str(out.get("age") or "unknown").strip().lower() or "unknown"
+    out["personality"] = str(out.get("personality") or "").strip()
+    out["voice_traits"] = str(out.get("voice_traits") or "").strip()
+
+    if "duration_factor" in out and out["duration_factor"] is not None:
+        try:
+            out["duration_factor"] = _clamp(float(out["duration_factor"]), 0.5, 2.0)
+        except (TypeError, ValueError):
+            out.pop("duration_factor", None)
+
+    if "base_emo" in out and out["base_emo"] is not None:
+        out["base_emo"] = _normalize_base_emo(out["base_emo"])
+
+    return out
+
+
+def _character_name_keys(char: dict) -> set[str]:
+    keys = set()
+    name = str(char.get("name") or "").strip()
+    if name:
+        keys.add(name)
+    for a in char.get("aliases") or []:
+        a_s = str(a).strip()
+        if a_s:
+            keys.add(a_s)
+    return keys
+
+
+def _merge_two_characters(a: dict, b: dict) -> dict:
+    """Merge b into a (prefer a for primary fields; union aliases)."""
+    merged = dict(a)
+    # Prefer longer / more informative personality and voice_traits
+    for field in ("personality", "voice_traits"):
+        av = str(a.get(field) or "")
+        bv = str(b.get(field) or "")
+        if len(bv) > len(av):
+            merged[field] = bv
+    for field in ("gender", "age"):
+        if (not a.get(field) or a.get(field) == "unknown") and b.get(field):
+            merged[field] = b[field]
+    # Union name keys into aliases; keep a's name as primary
+    names = _character_name_keys(a) | _character_name_keys(b)
+    primary = str(merged.get("name") or "").strip()
+    aliases = sorted(n for n in names if n and n != primary)
+    merged["aliases"] = aliases
+    # Prefer non-narrator id that looks stable; narrator handled separately
+    if a.get("role") == "narrator" or b.get("role") == "narrator":
+        merged["role"] = "narrator"
+        merged["id"] = "narrator"
+        if not primary or primary in {"unknown", "旁白"}:
+            merged["name"] = a.get("name") if a.get("role") == "narrator" else b.get("name")
+            if not merged.get("name"):
+                merged["name"] = "旁白"
+    return validate_character(merged)
+
+
+def merge_character_lists(batches: list[list[dict]]) -> list[dict]:
+    """
+    Merge character lists from chapter batches via undirected name/alias components.
+
+    Always returns exactly one narrator (id=narrator). Guarantees a default
+    narrator if none appears in input.
+    """
+    flat: list[dict] = []
+    for batch in batches or []:
+        if not batch:
+            continue
+        for item in batch:
+            if isinstance(item, dict):
+                flat.append(validate_character(item))
+
+    if not flat:
+        return [dict(_DEFAULT_NARRATOR)]
+
+    # Union-Find over name keys
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: str, y: str) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+    # Each character's name keys form a clique; shared keys link characters
+    char_keys: list[set[str]] = []
+    for ch in flat:
+        keys = _character_name_keys(ch)
+        if not keys:
+            keys = {ch["id"]}
+        char_keys.append(keys)
+        keys_list = list(keys)
+        for i in range(1, len(keys_list)):
+            union(keys_list[0], keys_list[i])
+
+    components: dict[str, list[int]] = {}
+    for idx, keys in enumerate(char_keys):
+        root = find(next(iter(keys)))
+        components.setdefault(root, []).append(idx)
+
+    merged_chars: list[dict] = []
+    narrators: list[dict] = []
+
+    for indices in components.values():
+        group = [flat[i] for i in indices]
+        # Prefer first occurrence as base; fold rest
+        acc = group[0]
+        for other in group[1:]:
+            acc = _merge_two_characters(acc, other)
+        if acc.get("role") == "narrator" or acc.get("id") == "narrator":
+            acc["id"] = "narrator"
+            acc["role"] = "narrator"
+            if not acc.get("name") or acc["name"] == "unknown":
+                acc["name"] = "旁白"
+            narrators.append(acc)
+        else:
+            merged_chars.append(acc)
+
+    # Exactly one narrator
+    if narrators:
+        acc = narrators[0]
+        for other in narrators[1:]:
+            acc = _merge_two_characters(acc, other)
+        acc["id"] = "narrator"
+        acc["role"] = "narrator"
+        narrator = validate_character(acc)
+    else:
+        narrator = dict(_DEFAULT_NARRATOR)
+
+    # De-dupe dialogue chars that might still equal narrator by name
+    final: list[dict] = [narrator]
+    narrator_keys = _character_name_keys(narrator) | {"narrator", "旁白"}
+    seen_ids: set[str] = {"narrator"}
+    for ch in merged_chars:
+        keys = _character_name_keys(ch)
+        if keys & narrator_keys:
+            continue
+        if ch["id"] in seen_ids:
+            # rename collision
+            ch = dict(ch)
+            ch["id"] = f"{ch['id']}_{len(seen_ids)}"
+        seen_ids.add(ch["id"])
+        final.append(validate_character(ch))
+
+    return final
+
+
+def _style_sample_text(text: str, chapters: list[dict]) -> str:
+    """Build a bounded sample for style analysis (not full novel)."""
+    parts: list[str] = []
+    head = text[:2500]
+    if head:
+        parts.append("【开头】\n" + head)
+    for ch in (chapters or [])[:8]:
+        start = int(ch.get("start_char") or 0)
+        end = int(ch.get("end_char") or start)
+        snippet = text[start : min(start + 200, end)]
+        title = ch.get("title") or ch.get("id") or ""
+        if snippet.strip():
+            parts.append(f"【{title}】\n{snippet}")
+    tail = text[-800:] if len(text) > 800 else ""
+    if tail and tail != head:
+        parts.append("【结尾】\n" + tail)
+    return "\n\n".join(parts)
+
+
+def analyze_style(text: str, chapters: list[dict], llm: Any) -> dict:
+    """
+    Ask LLM for overall novel style; return validated style dict.
+
+    Prompt requires JSON only (no markdown). Uses chapter samples, not full text.
+    """
+    sample = _style_sample_text(text or "", chapters or [])
+    prompt = (
+        "你是小说有声书风格分析助手。根据下列文本抽样，分析整体风格。\n"
+        "只输出 JSON，不要 markdown，不要解释。\n"
+        "字段：title, genre, narrative_pov, era, tone, pacing, lang, "
+        "narrator_style, duration_factor, base_emo。\n"
+        "lang 必须是 zh/en/ja/es/ar 之一。\n"
+        "duration_factor 为 0.8–1.3 的小数（旁白语速，1.0 正常）。\n"
+        "base_emo 为长度 8 的数组，顺序 "
+        "[happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]，"
+        "每项 0–1。\n\n"
+        f"文本抽样：\n{sample}"
+    )
+    raw = llm.chat(prompt)
+    parsed = _parse_json_response(raw)
+    if not isinstance(parsed, dict):
+        parsed = {}
+    return validate_style(parsed)
+
+
+def extract_characters(text: str, chapters: list[dict], llm: Any) -> list[dict]:
+    """
+    Extract characters per chapter (map) then merge (reduce).
+
+    For each chapter, if body > 6000 chars, split into 4000-char windows.
+    Always returns a list with exactly one narrator after merge.
+    """
+    batches: list[list[dict]] = []
+    chapters = chapters or []
+    text = text or ""
+
+    windows: list[tuple[str, str]] = []
+    if not chapters:
+        windows.append(("full", text[:4000] if text else ""))
+    else:
+        for ch in chapters:
+            start = int(ch.get("start_char") or 0)
+            end = int(ch.get("end_char") or start)
+            body = text[start:end]
+            cid = ch.get("id") or "c"
+            if len(body) <= 6000:
+                windows.append((cid, body))
+            else:
+                step = 4000
+                for i in range(0, len(body), step):
+                    windows.append((f"{cid}_{i // step}", body[i : i + step]))
+
+    for win_id, body in windows:
+        if not body.strip():
+            continue
+        prompt = (
+            "你是小说人物分析助手。从本章文本中提取说话人与旁白特征。\n"
+            "只输出 JSON 数组，不要 markdown，不要解释。\n"
+            "每个元素字段：id, name, aliases, role, gender, age, personality, voice_traits。\n"
+            "role 为 narrator 或 dialogue；旁白 id 必须为 narrator，name 为旁白。\n"
+            "id 用英文 snake_case；aliases 为字符串数组；gender 为 male/female/unknown；\n"
+            "age 为 child/young_adult/middle/elder/unknown。\n\n"
+            f"章节/窗口：{win_id}\n文本：\n{body[:4000]}"
+        )
+        raw = llm.chat(prompt)
+        parsed = _parse_json_response(raw)
+        batch: list[dict] = []
+        if isinstance(parsed, list):
+            batch = [c for c in parsed if isinstance(c, dict)]
+        elif isinstance(parsed, dict):
+            # Allow {"characters": [...]} wrapper
+            inner = parsed.get("characters") or parsed.get("people") or []
+            if isinstance(inner, list):
+                batch = [c for c in inner if isinstance(c, dict)]
+            else:
+                batch = [parsed]
+        if batch:
+            batches.append(batch)
+
+    return merge_character_lists(batches)
