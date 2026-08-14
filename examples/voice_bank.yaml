@@ -1,0 +1,19 @@
+voices:
+  - id: voice_01
+    path: examples/voice_01.wav
+    gender: female
+    age: young_adult
+    timbre: bright
+    languages: [ZH, EN]
+  - id: voice_04
+    path: examples/voice_04.wav
+    gender: male
+    age: young_adult
+    timbre: firm
+    languages: [ZH]
+  - id: voice_05
+    path: examples/voice_05.wav
+    gender: male
+    age: middle
+    timbre: deep
+    languages: [ZH]

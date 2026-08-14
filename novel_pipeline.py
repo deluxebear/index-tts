@@ -4,15 +4,19 @@ Novel audiobook pipeline: novel text → multi-speaker chapter WAVs via IndexTTS
 Task 1 provides text ingest, chapter splitting, and silent WAV concatenation.
 Task 2 adds dialogue/narration split and IndexTTS 2.5 sentence-length limits.
 Task 3 adds LLM style/character analysis and validation helpers.
-Later steps add voice cards and TTS.
+Task 4 adds seed voice bank matching and IndexTTS-2.5 character voice cards.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import wave
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from highlight_pipeline import LLMClient, _parse_json_response  # noqa: F401
 
@@ -729,3 +733,271 @@ def extract_characters(text: str, chapters: list[dict], llm: Any) -> list[dict]:
             batches.append(batch)
 
     return merge_character_lists(batches)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: seed voice bank matching + character voice cards (IndexTTS-2.5)
+# ---------------------------------------------------------------------------
+
+# Timbre tags → keywords that may appear in character voice_traits
+_TIMBRE_SYNONYMS: dict[str, list[str]] = {
+    "deep": ["deep", "低沉", "低", "沉", "浑厚"],
+    "firm": ["firm", "硬", "刚", "坚定", "有力"],
+    "bright": ["bright", "亮", "清亮", "偏亮", "清脆"],
+    "warm": ["warm", "暖", "温和", "柔"],
+    "soft": ["soft", "软", "柔和", "轻"],
+    "clear": ["clear", "清晰", "干净"],
+}
+
+_CARD_TAIL = (
+    "今天天气不错，山上的风从松树林里穿过来，溪水轻轻响着。一二三四五，金木水火土。"
+)
+
+
+def load_voice_bank(path: str) -> list[dict]:
+    """
+    Load seed voice entries from a YAML bank file.
+
+    Expects ``{voices: [{id, path, gender, age, timbre, languages}, ...]}``
+    or a bare list of the same dicts. Returns a list of plain dicts.
+    """
+    p = Path(path)
+    with open(p, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    if data is None:
+        return []
+    if isinstance(data, list):
+        voices = data
+    elif isinstance(data, dict):
+        voices = data.get("voices") or data.get("bank") or []
+    else:
+        return []
+
+    out: list[dict] = []
+    for item in voices:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        if "id" not in entry and "path" in entry:
+            entry["id"] = Path(str(entry["path"])).stem
+        out.append(entry)
+    return out
+
+
+def _is_narrator(char: dict) -> bool:
+    return char.get("role") == "narrator" or char.get("id") == "narrator"
+
+
+def _seed_match_score(
+    char: dict,
+    voice: dict,
+    used_ids: set[str],
+    *,
+    require_gender: bool = True,
+) -> float | None:
+    """
+    Deterministic score for assigning ``voice`` to ``char``.
+
+    Returns None if gender is incompatible under require_gender.
+    Higher is better; used seeds get a large penalty (collision avoidance).
+    """
+    char_g = str(char.get("gender") or "unknown").strip().lower() or "unknown"
+    voice_g = str(voice.get("gender") or "unknown").strip().lower() or "unknown"
+
+    if require_gender:
+        if char_g not in {"unknown", ""} and voice_g not in {"unknown", ""}:
+            if char_g != voice_g:
+                return None
+
+    score = 0.0
+    if char_g == voice_g and char_g not in {"unknown", ""}:
+        score += 100.0
+    elif char_g in {"unknown", ""} or voice_g in {"unknown", ""}:
+        score += 10.0
+
+    char_age = str(char.get("age") or "unknown").strip().lower() or "unknown"
+    voice_age = str(voice.get("age") or "unknown").strip().lower() or "unknown"
+    if char_age not in {"unknown", ""} and char_age == voice_age:
+        score += 50.0
+
+    traits = str(char.get("voice_traits") or "")
+    traits_l = traits.lower()
+    timbre = str(voice.get("timbre") or "").strip().lower()
+    if timbre:
+        if timbre in traits_l or timbre in traits:
+            score += 30.0
+        synonyms = _TIMBRE_SYNONYMS.get(timbre, [])
+        for kw in synonyms:
+            if not kw:
+                continue
+            if kw.lower() in traits_l or kw in traits:
+                score += 20.0
+                break
+
+    vid = voice.get("id")
+    if vid is not None and vid in used_ids:
+        score -= 1000.0
+
+    return score
+
+
+def _pick_seed_voice(
+    char: dict,
+    bank: list[dict],
+    used_ids: set[str],
+) -> dict | None:
+    """Pick best bank entry: gender match, age, timbre; unused preferred; yaml order ties."""
+    if not bank:
+        return None
+
+    def best(require_gender: bool) -> dict | None:
+        winner: dict | None = None
+        best_score = float("-inf")
+        best_idx = -1
+        for idx, voice in enumerate(bank):
+            s = _seed_match_score(char, voice, used_ids, require_gender=require_gender)
+            if s is None:
+                continue
+            if s > best_score or (s == best_score and (winner is None or idx < best_idx)):
+                winner = voice
+                best_score = s
+                best_idx = idx
+        return winner
+
+    return best(True) or best(False)
+
+
+def assign_seed_voices(
+    characters: list[dict],
+    bank: list[dict],
+    narrator_audio: str | None = None,
+) -> list[dict]:
+    """
+    Assign each character a seed voice from the bank.
+
+    Narrator is assigned first. ``narrator_audio`` overrides the narrator seed
+    path without consuming a bank entry. Gender must match when possible; used
+    seeds are heavily penalized to avoid collisions.
+    """
+    chars = [dict(c) for c in (characters or [])]
+    bank_list = list(bank or [])
+    used: set[str] = set()
+
+    order: list[int] = []
+    for i, c in enumerate(chars):
+        if _is_narrator(c):
+            order.append(i)
+    for i in range(len(chars)):
+        if i not in order:
+            order.append(i)
+
+    result: list[dict | None] = [None] * len(chars)
+    for i in order:
+        char = dict(chars[i])
+        if _is_narrator(char) and narrator_audio:
+            char["seed_path"] = narrator_audio
+            if not char.get("seed_voice_id"):
+                char["seed_voice_id"] = "narrator_custom"
+        else:
+            voice = _pick_seed_voice(char, bank_list, used)
+            if voice is not None:
+                vid = voice.get("id")
+                char["seed_voice_id"] = vid
+                char["seed_path"] = voice.get("path")
+                if vid is not None:
+                    used.add(vid)
+        result[i] = char
+
+    return [c if c is not None else dict(chars[i]) for i, c in enumerate(result)]
+
+
+def build_card_text(character: dict) -> str:
+    """
+    Build TTS text for a character voice card.
+
+    Prefers existing ``card_text``; otherwise a fixed template with name +
+    personality and a neutral phonetically-rich tail for timbre coverage.
+    """
+    existing = character.get("card_text")
+    if existing:
+        return str(existing)
+
+    name = str(character.get("name") or character.get("id") or "角色").strip() or "角色"
+    personality = str(
+        character.get("personality") or character.get("voice_traits") or "沉稳"
+    ).strip() or "沉稳"
+    personality = personality.rstrip("。.!！?？")
+    return f"我是{name}。{personality}。{_CARD_TAIL}"
+
+
+def generate_character_voices(
+    characters: list[dict],
+    tts: Any,
+    work_dir: str,
+    lang: str,
+    ref_mode: str,
+) -> list[dict]:
+    """
+    Produce per-character reference WAVs under ``{work_dir}/voices/``.
+
+    - ``ref_mode=="card"``: synthesize via ``tts.infer`` (IndexTTS-2.5 kwargs).
+    - ``ref_mode=="seed"``: copy seed audio to the card path.
+    Existing card WAVs are skipped. Writes ``voices/manifest.json``.
+    Characters may supply ``seed_path`` directly or after ``assign_seed_voices``.
+    """
+    voices_dir = Path(work_dir) / "voices"
+    voices_dir.mkdir(parents=True, exist_ok=True)
+
+    out: list[dict] = []
+    mode = (ref_mode or "card").strip().lower()
+
+    for raw in characters or []:
+        char = dict(raw)
+        cid = str(char.get("id") or "char").strip() or "char"
+        ref_wav = str(voices_dir / f"{cid}.wav")
+        seed_path = char.get("seed_path")
+
+        if Path(ref_wav).is_file():
+            char["ref_wav"] = ref_wav
+            out.append(char)
+            continue
+
+        if not seed_path:
+            char["ref_wav"] = None
+            out.append(char)
+            continue
+
+        if mode == "seed":
+            shutil.copy2(str(seed_path), ref_wav)
+        else:
+            card_text = char.get("card_text") or build_card_text(char)
+            char["card_text"] = card_text
+            base_emo = char.get("base_emo")
+            if base_emo is None:
+                base_emo = [0.0] * _EMO_DIMS
+            else:
+                base_emo = _normalize_base_emo(base_emo)
+            emo_vector = tts.normalize_emo_vec(base_emo)
+            tts.infer(
+                spk_audio_prompt=seed_path,
+                text=card_text,
+                lang=lang,
+                output_path=ref_wav,
+                emo_vector=emo_vector,
+                duration_factor=1.0,
+                interval_silence=200,
+                max_text_tokens_per_segment=120,
+                use_random=False,
+                verbose=False,
+            )
+
+        char["ref_wav"] = ref_wav
+        out.append(char)
+
+    manifest_path = voices_dir / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    return out
+

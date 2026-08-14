@@ -1,6 +1,9 @@
 from novel_pipeline import (
+    assign_seed_voices,
+    build_card_text,
     enforce_tts_limits,
     extract_characters,
+    generate_character_voices,
     ingest_text,
     merge_character_lists,
     split_chapters,
@@ -84,4 +87,46 @@ def test_extract_characters_sends_full_midsize_chapter_body():
     assert len(seen) == 1
     assert marker in seen[0]
     assert body in seen[0]
+
+
+def test_assign_seed_voices_prefers_gender_and_avoids_collision():
+    bank = [
+        {"id": "voice_04", "path": "a.wav", "gender": "male", "age": "young_adult", "timbre": "firm"},
+        {"id": "voice_05", "path": "b.wav", "gender": "male", "age": "middle", "timbre": "deep"},
+        {"id": "voice_01", "path": "c.wav", "gender": "female", "age": "young_adult", "timbre": "bright"},
+    ]
+    chars = [
+        {"id": "narrator", "name": "旁白", "role": "narrator", "gender": "male", "age": "middle", "voice_traits": "低沉"},
+        {"id": "zhang_san", "name": "张三", "role": "dialogue", "gender": "male", "age": "young_adult", "voice_traits": "硬"},
+        {"id": "li_si", "name": "李四", "role": "dialogue", "gender": "female", "age": "young_adult", "voice_traits": "亮"},
+    ]
+    out = assign_seed_voices(chars, bank)
+    seeds = {c["id"]: c["seed_voice_id"] for c in out}
+    assert seeds["narrator"] == "voice_05"
+    assert seeds["zhang_san"] == "voice_04"
+    assert seeds["li_si"] == "voice_01"
+    assert len(set(seeds.values())) == 3
+
+
+def test_generate_character_voices_writes_card(tmp_path):
+    recorded = []
+
+    class FakeTTS:
+        def normalize_emo_vec(self, v):
+            return v
+
+        def infer(self, **kwargs):
+            recorded.append(kwargs)
+            open(kwargs["output_path"], "wb").write(b"RIFF")
+
+    chars = [{
+        "id": "zhang_san", "name": "张三", "personality": "急躁",
+        "seed_path": "seed.wav", "base_emo": [0, 0.1, 0, 0, 0, 0, 0, 0.2],
+        "duration_factor": 0.95, "card_text": None,
+    }]
+    out = generate_character_voices(chars, FakeTTS(), str(tmp_path), "zh", "card")
+    assert recorded[0]["lang"] == "zh"
+    assert recorded[0]["spk_audio_prompt"] == "seed.wav"
+    assert out[0]["ref_wav"].endswith("zhang_san.wav")
+
 
