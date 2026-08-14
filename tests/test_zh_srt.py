@@ -38,6 +38,32 @@ def test_caption_spans_are_proportional():
     assert d1 > d0
 
 
+def test_zh_source_fills_english_sidecar(tmp_path):
+    from dub_pipeline import build_segments_from_subtitles, generate_srt
+
+    video = tmp_path / "00-introduction.mp4"
+    video.write_bytes(b"")
+    (tmp_path / "00-introduction.zh.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\n大家好\n\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "00-introduction.en.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\nHello everyone\n\n",
+        encoding="utf-8",
+    )
+    # leftover empty sidecar must not be used as the English source
+    (tmp_path / "00-introduction_cn_en.srt").write_text("", encoding="utf-8")
+    segs, source = build_segments_from_subtitles(str(video), "vocals.wav", num_speakers=1)
+    assert source.startswith("zh:")
+    assert segs[0]["zh_text"] == "大家好"
+    assert segs[0]["text"] == "Hello everyone"
+    en_out = tmp_path / "00-introduction_cn_en.srt"
+    generate_srt(segs, str(en_out), lang="en")
+    body = en_out.read_text(encoding="utf-8")
+    assert en_out.stat().st_size > 0
+    assert "Hello everyone" in body
+
+
 def test_generate_srt_splits_zh_keeps_en(tmp_path):
     segs = [{
         "start": 0.0, "end": 10.0, "new_start": 0.0, "aligned_duration": 10.0,

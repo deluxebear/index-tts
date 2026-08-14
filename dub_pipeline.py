@@ -1546,7 +1546,7 @@ def convert_traditional_to_simplified(cues):
     return cues
 
 
-def discover_subtitle(video_path, quiet=False):
+def discover_subtitle(video_path, quiet=False, prefer_lang=None):
     """Find the best matching subtitle file for a video.
 
     Globs for {stem}*.srt and {stem}*.ass, extracts language code from filename
@@ -1577,6 +1577,11 @@ def discover_subtitle(video_path, quiet=False):
         # Skip the video file itself
         if path.suffix in (".mp4", ".mkv", ".mov", ".avi"):
             continue
+        stem_l = path.stem.lower()
+        # Skip this pipeline's own outputs so a previous empty *_cn_en.srt
+        # cannot become the next run's English source.
+        if stem_l.endswith("_cn") or stem_l.endswith("_cn_en"):
+            continue
         # Extract language tag from the part after the video stem
         suffix_part = path.stem[len(stem):]  # e.g. ".TED.zh-CN" or ".zh" or ""
         parts = [p.lower() for p in suffix_part.split(".") if p]
@@ -1592,8 +1597,32 @@ def discover_subtitle(video_path, quiet=False):
     if not candidates:
         return None, None
 
+    def _detect_if_unknown(path, hint):
+        if hint != "unknown":
+            return hint
+        parser = parse_ass if path.suffix == ".ass" else parse_srt
+        cues = parser(str(path))
+        if not cues:
+            return hint
+        sample = " ".join(c["text"] for c in cues[:50])
+        return detect_subtitle_language(sample)
+
     # Best priority first, then shorter filename (more specific match)
     candidates.sort(key=lambda x: (x[2], len(x[0].name)))
+    if prefer_lang:
+        preferred = []
+        for path, hint, pri in candidates:
+            hint = _detect_if_unknown(path, hint)
+            if hint == prefer_lang:
+                preferred.append((path, hint, pri))
+        if not preferred:
+            return None, None
+        preferred.sort(key=lambda x: (x[2], len(x[0].name)))
+        best_path, lang_hint, _ = preferred[0]
+        if not quiet:
+            print(f"  Found subtitle: {best_path.name} (detected: {lang_hint})")
+        return str(best_path), lang_hint
+
     best_path, lang_hint, _ = candidates[0]
 
     # For unknown language, detect from content
@@ -1872,6 +1901,55 @@ def translation_needs_llm(video_path, no_external_subs=False, external_subs=None
     return lang_hint == "en"
 
 
+def fill_english_text(segments, video_path, min_overlap=0.15):
+    """Fill empty ``text`` from a sibling English subtitle (time overlap).
+
+    Used so ``*_cn_en.srt`` is not empty when speech came from Chinese cues.
+    """
+    if not segments or not video_path:
+        return segments
+    if any((s.get("text") or "").strip() for s in segments):
+        return segments
+    en_path, lang = discover_subtitle(video_path, quiet=True, prefer_lang="en")
+    if not en_path or lang != "en":
+        return segments
+    parser = parse_ass if en_path.endswith(".ass") else parse_srt
+    cues = clean_subtitle_cues(parser(en_path))
+    if not cues:
+        return segments
+    sorted_cues = sorted(cues, key=lambda c: c["start"])
+    filled = 0
+    for seg in segments:
+        if (seg.get("text") or "").strip():
+            continue
+        seg_start, seg_end = seg["start"], seg["end"]
+        seg_dur = seg_end - seg_start
+        collected = []
+        for cue in sorted_cues:
+            if cue["start"] >= seg_end:
+                break
+            overlap = min(seg_end, cue["end"]) - max(seg_start, cue["start"])
+            if overlap <= 0:
+                continue
+            if seg_dur <= 0 or overlap / seg_dur >= min_overlap or overlap >= 0.2:
+                collected.append((cue["start"], cue["text"]))
+        if not collected:
+            continue
+        collected.sort()
+        seen = set()
+        parts = []
+        for _, piece in collected:
+            if piece and piece not in seen:
+                seen.add(piece)
+                parts.append(piece)
+        if parts:
+            seg["text"] = " ".join(parts)
+            filled += 1
+    if filled:
+        print(f"  Filled English text for {filled} segments from {Path(en_path).name}")
+    return segments
+
+
 def cues_to_segments(cues, lang_hint):
     """Turn cleaned cues into pipeline segments."""
     is_english = lang_hint == "en"
@@ -1915,6 +1993,7 @@ def build_segments_from_subtitles(
     )
     text_lang = "en" if lang_hint == "en" else "zh"
     segments = deoverlap_same_speaker_segments(cues_to_segments(cues, text_lang))
+    segments = fill_english_text(segments, video_path)
     print(f"  Subtitle-driven ({text_lang}): {len(segments)} cues, Whisper skipped")
     return segments, f"{source_desc}:{Path(sub_path).name}"
 
@@ -2041,6 +2120,7 @@ def build_subtitle_driven_segments(video_path, asr_segments, external_subs=None)
             })
 
     segments = deoverlap_same_speaker_segments(segments)
+    segments = fill_english_text(segments, video_path)
     if is_english:
         print(f"  Subtitle-driven (EN): {len(segments)} cleaned cues will be LLM-translated "
               f"(ASR had {len(asr_segments)} segments)")
@@ -2756,6 +2836,9 @@ def generate_srt(segments, output_path, lang="zh"):
                 f.write(
                     f"{idx}\n{_format_srt_time(a)} --> {_format_srt_time(b)}\n{cap}\n\n"
                 )
+    if idx == 0:
+        print(f"  Warning: no cues written to {output_path} "
+              f"(no {'zh_text' if lang == 'zh' else 'English text'} on segments)")
     print(f"  Saved SRT: {output_path}")
 
 
@@ -2983,6 +3066,7 @@ def redub_segments(
     )
 
     srt_base = output_path.rsplit(".", 1)[0]
+    segments = fill_english_text(segments, video_path)
     generate_srt(segments, f"{srt_base}.srt", lang="zh")
     generate_srt(segments, f"{srt_base}_en.srt", lang="en")
 
@@ -3262,6 +3346,7 @@ def dub_video(
 
     # --- Step 10-11: SRT subtitles ---
     print("\n[Step 10-11/11] Generating subtitles...")
+    segments = fill_english_text(segments, video_path)
     srt_base = output_path.rsplit(".", 1)[0]
     generate_srt(segments, f"{srt_base}.srt", lang="zh")
     generate_srt(segments, f"{srt_base}_en.srt", lang="en")
