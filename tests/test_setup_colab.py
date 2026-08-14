@@ -21,3 +21,5 @@ def test_setup_colab_script_installs_matching_torch_stack():
     assert "keras" in text
     assert "torchvision.ops import nms" in text
     assert "--extra" in text
+    assert "novel" in text
+    assert "openai" in text

@@ -10,7 +10,7 @@ EXTRA=""
 
 usage() {
     cat <<'EOF'
-Usage: bash tools/setup_colab.sh [--extra webui|dub|highlight|intent] [--verbose]
+Usage: bash tools/setup_colab.sh [--extra webui|dub|highlight|intent|novel] [--verbose]
 
 Installs IndexTTS into the current Python (Colab system Python).
 Always installs a cu128 torch / torchvision / torchaudio set that match.
@@ -171,11 +171,18 @@ install_vl_extras() {
     fi
 }
 
+install_novel_extras() {
+    step "extras" "openai"
+    run_quiet "pip novel extras" \
+        "${PIP[@]}" install -q openai soundfile
+}
+
 case "$EXTRA" in
     ""|webui) ;;
     dub) install_dub_extras ;;
     highlight|intent) install_vl_extras ;;
-    *) setup_fail 2 "unknown --extra $EXTRA (use webui|dub|highlight|intent)" ;;
+    novel) install_novel_extras ;;
+    *) setup_fail 2 "unknown --extra $EXTRA (use webui|dub|highlight|intent|novel)" ;;
 esac
 
 echo ""
