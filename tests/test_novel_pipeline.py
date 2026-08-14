@@ -1,5 +1,6 @@
 from novel_pipeline import (
     enforce_tts_limits,
+    extract_characters,
     ingest_text,
     merge_character_lists,
     split_chapters,
@@ -64,4 +65,23 @@ def test_validate_style_clamps_duration_and_emo():
     assert style["lang"] == "zh"
     assert 0.8 <= style["duration_factor"] <= 1.3
     assert len(style["base_emo"]) == 8
+
+
+def test_extract_characters_sends_full_midsize_chapter_body():
+    """Chapters of 4001–6000 chars must not be re-truncated to 4000 in the LLM prompt."""
+    marker = "TAIL_MARKER_XYZ"
+    body = ("甲" * (5000 - len(marker))) + marker
+    assert len(body) == 5000
+    chapters = [{"id": "c01", "start_char": 0, "end_char": len(body)}]
+    seen: list[str] = []
+
+    class FakeLLM:
+        def chat(self, prompt: str) -> str:
+            seen.append(prompt)
+            return "[]"
+
+    extract_characters(body, chapters, FakeLLM())
+    assert len(seen) == 1
+    assert marker in seen[0]
+    assert body in seen[0]
 

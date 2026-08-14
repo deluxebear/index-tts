@@ -711,7 +711,7 @@ def extract_characters(text: str, chapters: list[dict], llm: Any) -> list[dict]:
             "role 为 narrator 或 dialogue；旁白 id 必须为 narrator，name 为旁白。\n"
             "id 用英文 snake_case；aliases 为字符串数组；gender 为 male/female/unknown；\n"
             "age 为 child/young_adult/middle/elder/unknown。\n\n"
-            f"章节/窗口：{win_id}\n文本：\n{body[:4000]}"
+            f"章节/窗口：{win_id}\n文本：\n{body}"
         )
         raw = llm.chat(prompt)
         parsed = _parse_json_response(raw)
