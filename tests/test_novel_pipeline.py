@@ -1,7 +1,11 @@
+import json
+import re
+
 from novel_pipeline import (
     assign_seed_voices,
     assign_silence,
     build_card_text,
+    build_chapter_script,
     enforce_tts_limits,
     extract_characters,
     generate_character_voices,
@@ -13,6 +17,7 @@ from novel_pipeline import (
     validate_character,
     validate_style,
 )
+
 
 
 def test_split_chapters_chinese_heading():
@@ -149,5 +154,35 @@ def test_prepare_tts_text_applies_glossary(tmp_path, monkeypatch):
     (tmp_path / "pronunciation.yaml").write_text("银行: 银<行|HANG2>\n", encoding="utf-8")
     text = prepare_tts_text("他去银行了", str(tmp_path))
     assert "<行|HANG2>" in text
+
+
+def test_build_chapter_script_resplits_oversized_llm_tts_text(tmp_path):
+    """LLM-rewritten tts_text longer than 80 must be re-split with speaker/emo kept."""
+    long_tts = "甲" * 150
+    emo = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+    class FakeLLM:
+        def chat(self, prompt: str) -> str:
+            return json.dumps([{
+                "index": 0,
+                "speaker_id": "narrator",
+                "emo_vector": emo,
+                "tts_text": long_tts,
+            }], ensure_ascii=False)
+
+    characters = [{
+        "id": "narrator", "name": "旁白", "role": "narrator",
+        "gender": "male", "age": "middle", "personality": "沉", "voice_traits": "低",
+    }]
+    out = build_chapter_script(
+        "短句。", "c01", characters, {"lang": "zh"}, FakeLLM(), str(tmp_path),
+    )
+    assert len(out) >= 2
+    pron_re = re.compile(r"<[^|>]+\|[^>]+>")
+    for u in out:
+        visible = pron_re.sub("X", u["tts_text"] or "")
+        assert len(visible) <= 80
+        assert u["speaker_id"] == "narrator"
+        assert u["emo_vector"] == emo
 
 

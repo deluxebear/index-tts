@@ -1257,6 +1257,7 @@ def build_chapter_script(
     Pipeline:
       split_utterances → enforce_tts_limits → LLM attribution (batches of 40)
       → validate speaker_id ∈ character table (else narrator)
+      → re-enforce_tts_limits after LLM rewrite (keep speaker/emo on pieces)
       → prepare_tts_text (glossary) → character duration_factor → assign_silence
 
     LLM failure falls back to ``estimate_emotion_from_text`` (and narrator / original text).
@@ -1294,7 +1295,7 @@ def build_chapter_script(
         item["wav_path"] = None
 
         kind = str(item.get("kind") or "narration")
-        default_speaker = "narrator" if kind != "dialogue" else "narrator"
+        default_speaker = "narrator"
 
         speaker_id = default_speaker
         tts_text = item.get("tts_text") or item.get("text") or ""
@@ -1320,12 +1321,31 @@ def build_chapter_script(
 
         item["speaker_id"] = speaker_id
         item["emo_vector"] = emo
-        item["tts_text"] = prepare_tts_text(tts_text, work_dir)
         item["duration_factor"] = _resolve_duration_factor(character, style)
-        built.append(item)
 
-    return assign_silence(built)
+        # LLM rewrite may exceed 80 chars; re-split and keep speaker/emo on each piece
+        parts = enforce_tts_limits(str(tts_text or ""), max_chars=80)
+        if not parts:
+            fallback = str(tts_text or item.get("text") or "").strip()
+            if not fallback:
+                continue
+            parts = [fallback]
+        for part in parts:
+            nu = dict(item)
+            nu["tts_text"] = prepare_tts_text(part, work_dir)
+            if kind != "dialogue":
+                nu["text"] = part
+            built.append(nu)
 
+    seq = 0
+    resequenced: list[dict] = []
+    for utt in built:
+        seq += 1
+        nu = dict(utt)
+        nu["seq"] = seq
+        nu["id"] = f"{chapter_id}_{seq:04d}"
+        nu["chapter_id"] = chapter_id
+        resequenced.append(nu)
 
-    return out
+    return assign_silence(resequenced)
 
