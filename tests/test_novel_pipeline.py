@@ -1,7 +1,7 @@
 import json
 import re
-
 import wave
+from pathlib import Path
 
 from novel_pipeline import (
     assign_seed_voices,
@@ -12,6 +12,7 @@ from novel_pipeline import (
     extract_characters,
     generate_character_voices,
     ingest_text,
+    load_voice_bank,
     merge_chapter,
     merge_character_lists,
     prepare_tts_text,
@@ -131,14 +132,16 @@ def test_generate_character_voices_writes_card(tmp_path):
             recorded.append(kwargs)
             open(kwargs["output_path"], "wb").write(b"RIFF")
 
+    seed = tmp_path / "seed.wav"
+    _write_wav(seed)
     chars = [{
         "id": "zhang_san", "name": "张三", "personality": "急躁",
-        "seed_path": "seed.wav", "base_emo": [0, 0.1, 0, 0, 0, 0, 0, 0.2],
+        "seed_path": str(seed), "base_emo": [0, 0.1, 0, 0, 0, 0, 0, 0.2],
         "duration_factor": 0.95, "card_text": None,
     }]
     out = generate_character_voices(chars, FakeTTS(), str(tmp_path), "zh", "card")
     assert recorded[0]["lang"] == "zh"
-    assert recorded[0]["spk_audio_prompt"] == "seed.wav"
+    assert recorded[0]["spk_audio_prompt"] == str(seed)
     assert out[0]["ref_wav"].endswith("zhang_san.wav")
 
 
@@ -210,7 +213,9 @@ def test_synthesize_chapter_passes_v25_kwargs(tmp_path):
             recorded.append(kwargs)
             _write_wav(kwargs["output_path"])
 
-    chars = {"zhang_san": {"ref_wav": "ref.wav", "duration_factor": 0.95}}
+    ref = tmp_path / "ref.wav"
+    _write_wav(ref)
+    chars = {"zhang_san": {"ref_wav": str(ref), "duration_factor": 0.95}}
     utts = [{
         "id": "c01_0000", "chapter_id": "c01", "seq": 0,
         "speaker_id": "zhang_san", "kind": "dialogue",
@@ -220,7 +225,7 @@ def test_synthesize_chapter_passes_v25_kwargs(tmp_path):
     }]
     out = synthesize_chapter(utts, chars, FakeTTS(), str(tmp_path))
     assert recorded[0]["lang"] == "zh"
-    assert recorded[0]["spk_audio_prompt"] == "ref.wav"
+    assert recorded[0]["spk_audio_prompt"] == str(ref)
     assert recorded[0]["duration_factor"] == 0.95
     assert out[0]["wav_path"].endswith("0000.wav")
 
@@ -287,5 +292,150 @@ def test_cli_requires_llm_for_full_run(monkeypatch):
         assert exc.code not in (0, None)
     else:
         raise AssertionError("full run without LLM key should exit")
+
+
+def test_voice_bank_drops_missing_and_falls_back_to_ref_audio(tmp_path):
+    existing = tmp_path / "ok.wav"
+    _write_wav(existing)
+    bank_path = tmp_path / "bank.yaml"
+    bank_path.write_text(
+        "voices:\n"
+        "  - id: gone\n"
+        "    path: /no/such/voice.wav\n"
+        "    gender: male\n"
+        "  - id: ok\n"
+        f"    path: {existing.name}\n"
+        "    gender: female\n"
+        "  - id: also_gone\n"
+        "    path: missing2.wav\n",
+        encoding="utf-8",
+    )
+    bank = load_voice_bank(str(bank_path))
+    assert [e["id"] for e in bank] == ["ok"]
+    assert Path(bank[0]["path"]).is_file()
+
+    empty_bank_path = tmp_path / "empty.yaml"
+    empty_bank_path.write_text(
+        "voices:\n"
+        "  - id: gone\n"
+        "    path: /no/such/voice.wav\n",
+        encoding="utf-8",
+    )
+    assert load_voice_bank(str(empty_bank_path)) == []
+
+    ref = tmp_path / "narrator.wav"
+    _write_wav(ref)
+    chars = [
+        {"id": "narrator", "name": "旁白", "role": "narrator",
+         "gender": "male", "age": "middle", "voice_traits": "低"},
+        {"id": "zhang_san", "name": "张三", "role": "dialogue",
+         "gender": "male", "age": "young_adult", "voice_traits": "硬"},
+    ]
+    out = assign_seed_voices(chars, [], narrator_audio=str(ref))
+    assert all(c.get("seed_path") == str(ref) for c in out)
+
+    recorded = []
+
+    class FakeTTS:
+        def infer(self, **kwargs):
+            recorded.append(kwargs)
+
+        def normalize_emo_vec(self, v):
+            return v
+
+    skipped = generate_character_voices(
+        [{"id": "ghost", "name": "鬼", "seed_path": str(tmp_path / "nope.wav")}],
+        FakeTTS(), str(tmp_path), "zh", "card",
+    )
+    assert recorded == []
+    assert not skipped[0].get("ref_wav")
+    manifest = json.loads((tmp_path / "voices" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest[0].get("ref_wav") in (None, "") or "ref_wav" not in manifest[0]
+
+
+def test_synthesize_chapter_no_infer_without_ref_wav(tmp_path):
+    recorded = []
+
+    class FakeTTS:
+        def infer(self, **kwargs):
+            recorded.append(kwargs)
+            raise AssertionError("should not infer without ref_wav")
+
+        def normalize_emo_vec(self, v):
+            return v
+
+    utts = [{
+        "id": "c01_0000", "chapter_id": "c01", "seq": 0,
+        "speaker_id": "zhang_san", "tts_text": "别过来。", "lang": "zh",
+        "emo_vector": [0] * 8, "duration_factor": 1.0, "silence_after_ms": 200,
+    }]
+    synthesize_chapter(
+        utts, {"zhang_san": {"ref_wav": None}}, FakeTTS(), str(tmp_path), strict=False,
+    )
+    assert recorded == []
+    try:
+        synthesize_chapter(
+            utts, {"zhang_san": {}}, FakeTTS(), str(tmp_path / "strict"), strict=True,
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("strict missing ref_wav should raise")
+    assert recorded == []
+
+
+def test_pronoun_aliases_do_not_merge_named_characters():
+    merged = merge_character_lists([
+        [{"id": "zhang_san", "name": "张三", "aliases": ["他", "she"], "role": "dialogue",
+          "gender": "male", "age": "young_adult", "personality": "急", "voice_traits": "亮"}],
+        [{"id": "li_si", "name": "李四", "aliases": ["他", "she", "they"], "role": "dialogue",
+          "gender": "male", "age": "young_adult", "personality": "稳", "voice_traits": "低"}],
+    ])
+    names = {c["name"] for c in merged if c.get("role") != "narrator"}
+    assert names == {"张三", "李四"}
+
+
+def test_cleanup_with_chapter_refused(tmp_path):
+    src = tmp_path / "book.txt"
+    src.write_text("第一章 一\n你好。\n", encoding="utf-8")
+    try:
+        run_novel_pipeline(
+            input_path=str(src),
+            output=str(tmp_path / "out"),
+            work_dir=str(tmp_path / "ws"),
+            stop_after="chapters",
+            cleanup=True,
+            chapter=1,
+            llm_api_key="dummy",
+        )
+    except ValueError as exc:
+        msg = str(exc).lower()
+        assert "cleanup" in msg and "chapter" in msg
+    else:
+        raise AssertionError("--cleanup with --chapter should be refused")
+
+    from novel_pipeline import main
+    try:
+        main([
+            str(src), "-o", str(tmp_path / "out"),
+            "--work-dir", str(tmp_path / "ws"),
+            "--stop-after", "chapters",
+            "--cleanup", "--chapter", "1",
+        ])
+    except SystemExit as exc:
+        assert exc.code not in (0, None)
+    else:
+        raise AssertionError("CLI --cleanup --chapter should exit")
+
+
+def test_split_chapters_blank_lines_on_long_text():
+    para = "甲" * 5500
+    text = (para + "\n\n\n\n") * 3 + para + "\n"
+    assert len(text) > 20000
+    assert "第" not in text and "Chapter" not in text
+    chapters = split_chapters(text, "long_blank.txt")
+    assert len(chapters) >= 2
+    assert chapters[0]["start_char"] < chapters[1]["start_char"]
+    assert chapters[-1]["end_char"] == len(text)
 
 

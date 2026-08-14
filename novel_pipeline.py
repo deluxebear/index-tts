@@ -46,6 +46,9 @@ CHAPTER_RE = re.compile(
 _CHAPTER_RE_EN = re.compile(r"(?m)^(Chapter\s+\d+[^\n]*)", re.IGNORECASE)
 # Short numbered headings: "1 Title" / "1.2 Title" with line length < 40
 _CHAPTER_RE_NUM = re.compile(r"(?m)^(\d+(?:\.\d+)*\s+\S[^\n]*)$")
+# Weak rule 4: 4+ consecutive newlines as extra boundaries on long texts
+_CHAPTER_RE_BLANK = re.compile(r"\n{4,}")
+_WEAK_CHAPTER_MIN_CHARS = 20000
 
 # IndexTTS pronunciation tags: <字|PINYIN>
 _PRON_TAG_RE = re.compile(r"<[^|>]+\|[^>]+>")
@@ -72,13 +75,8 @@ def ingest_text(raw: str) -> str:
     return raw.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def split_chapters(text: str, source_name: str) -> list[dict]:
-    """
-    Split text into chapters by heading rules.
-
-    Returns list of dicts: {id, index, title, start_char, end_char}.
-    id is c{index:02d}. No match → single chapter titled from source_name.
-    """
+def _heading_matches(text: str) -> list[re.Match[str]]:
+    """Apply chapter heading rules 1–3 in priority order."""
     matches = list(CHAPTER_RE.finditer(text))
     if not matches:
         matches = list(_CHAPTER_RE_EN.finditer(text))
@@ -88,34 +86,104 @@ def split_chapters(text: str, source_name: str) -> list[dict]:
             for m in _CHAPTER_RE_NUM.finditer(text)
             if len(m.group(0)) < 40
         ]
+    return matches
 
-    if not matches:
-        title = Path(source_name).stem if source_name else "chapter"
-        return [
-            {
-                "id": "c01",
-                "index": 1,
-                "title": title,
-                "start_char": 0,
-                "end_char": len(text),
-            }
-        ]
 
+def _single_chapter(text: str, source_name: str) -> list[dict]:
+    title = Path(source_name).stem if source_name else "chapter"
+    return [
+        {
+            "id": "c01",
+            "index": 1,
+            "title": title,
+            "start_char": 0,
+            "end_char": len(text),
+        }
+    ]
+
+
+def _title_for_chapter_slice(
+    text: str,
+    start: int,
+    end: int,
+    source_name: str,
+    heading: str | None,
+) -> str:
+    if heading:
+        return heading.strip()
+    snippet = text[start:end].lstrip("\n")
+    first = snippet.split("\n", 1)[0].strip()
+    if first:
+        return first[:80]
+    return Path(source_name).stem if source_name else "chapter"
+
+
+def _chapters_from_starts(
+    text: str,
+    starts: list[int],
+    source_name: str,
+    heading_titles: dict[int, str] | None = None,
+) -> list[dict]:
+    """Build chapter dicts from unique start offsets (end = next start)."""
+    titles = heading_titles or {}
+    bounds = sorted({s for s in starts if 0 <= s <= len(text)})
+    if not bounds:
+        return _single_chapter(text, source_name)
     chapters: list[dict] = []
-    for i, match in enumerate(matches):
-        start = match.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        index = i + 1
+    for i, start in enumerate(bounds):
+        end = bounds[i + 1] if i + 1 < len(bounds) else len(text)
+        if start >= end or not text[start:end].strip():
+            continue
+        index = len(chapters) + 1
         chapters.append(
             {
                 "id": f"c{index:02d}",
                 "index": index,
-                "title": match.group(1).strip(),
+                "title": _title_for_chapter_slice(
+                    text, start, end, source_name, titles.get(start),
+                ),
                 "start_char": start,
                 "end_char": end,
             }
         )
-    return chapters
+    return chapters or _single_chapter(text, source_name)
+
+
+def split_chapters(text: str, source_name: str) -> list[dict]:
+    """
+    Split text into chapters by heading rules.
+
+    Returns list of dicts: {id, index, title, start_char, end_char}.
+    id is c{index:02d}. No match → single chapter titled from source_name.
+    If text is longer than 20000 chars and rules 1–3 find fewer than 2
+    chapters, ``\\n{4,}`` is used as additional chapter boundaries.
+    """
+    matches = _heading_matches(text)
+    heading_titles = {m.start(): m.group(1).strip() for m in matches}
+
+    if len(text) > _WEAK_CHAPTER_MIN_CHARS and len(matches) < 2:
+        extra_starts = [
+            m.end()
+            for m in _CHAPTER_RE_BLANK.finditer(text)
+            if 0 < m.end() < len(text)
+        ]
+        if extra_starts:
+            starts = [0] + [m.start() for m in matches] + extra_starts
+            chapters = _chapters_from_starts(
+                text, starts, source_name, heading_titles,
+            )
+            if len(chapters) >= 2:
+                return chapters
+
+    if not matches:
+        return _single_chapter(text, source_name)
+
+    return _chapters_from_starts(
+        text,
+        [m.start() for m in matches],
+        source_name,
+        heading_titles,
+    )
 
 
 def _strip_wrapping_quotes(s: str) -> str:
@@ -381,6 +449,22 @@ _DEFAULT_NARRATOR = {
     "personality": "沉稳",
     "voice_traits": "低沉",
 }
+_DEFAULT_CROWD = {
+    "id": "crowd",
+    "name": "路人",
+    "aliases": [],
+    "role": "crowd",
+    "gender": "unknown",
+    "age": "unknown",
+    "personality": "",
+    "voice_traits": "",
+}
+_MAX_MAIN_CAST = 24
+# Pronouns / 1-char aliases must not be union-find identity keys.
+_PRONOUN_IDENTITY_KEYS = frozenset({
+    "他", "她", "它", "他们", "她们", "它们",
+    "you", "he", "she", "they", "him", "her",
+})
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -512,6 +596,12 @@ def validate_character(data: dict) -> dict:
     if "base_emo" in out and out["base_emo"] is not None:
         out["base_emo"] = _normalize_base_emo(out["base_emo"])
 
+    if "appearance" in out and out["appearance"] is not None:
+        try:
+            out["appearance"] = max(0, int(out["appearance"]))
+        except (TypeError, ValueError):
+            out["appearance"] = 1
+
     return out
 
 
@@ -525,6 +615,41 @@ def _character_name_keys(char: dict) -> set[str]:
         if a_s:
             keys.add(a_s)
     return keys
+
+
+def _is_usable_alias_key(alias: str) -> bool:
+    """False for 1-char aliases and pronouns (not used as union-find keys)."""
+    if not alias:
+        return False
+    if len(alias) == 1:
+        return False
+    if alias.casefold() in _PRONOUN_IDENTITY_KEYS:
+        return False
+    return True
+
+
+def _character_identity_keys(char: dict) -> set[str]:
+    """Name keys for union-find: names always merge; skip weak aliases."""
+    keys: set[str] = set()
+    name = str(char.get("name") or "").strip()
+    if name:
+        keys.add(name)
+    for a in char.get("aliases") or []:
+        a_s = str(a).strip()
+        if a_s and _is_usable_alias_key(a_s):
+            keys.add(a_s)
+    return keys
+
+
+def _character_appearance(char: dict) -> int | None:
+    for key in ("appearance", "appearances", "count", "mentions"):
+        if char.get(key) is None:
+            continue
+        try:
+            return int(char[key])
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _merge_two_characters(a: dict, b: dict) -> dict:
@@ -544,6 +669,10 @@ def _merge_two_characters(a: dict, b: dict) -> dict:
     primary = str(merged.get("name") or "").strip()
     aliases = sorted(n for n in names if n and n != primary)
     merged["aliases"] = aliases
+    appear_a = _character_appearance(a)
+    appear_b = _character_appearance(b)
+    if appear_a is not None or appear_b is not None:
+        merged["appearance"] = (appear_a or 0) + (appear_b or 0)
     # Prefer non-narrator id that looks stable; narrator handled separately
     if a.get("role") == "narrator" or b.get("role") == "narrator":
         merged["role"] = "narrator"
@@ -588,10 +717,13 @@ def merge_character_lists(batches: list[list[dict]]) -> list[dict]:
         if rx != ry:
             parent[ry] = rx
 
-    # Each character's name keys form a clique; shared keys link characters
+    # Each character's identity keys form a clique; shared keys link characters.
+    # Pronouns and 1-char aliases are not identity keys (names still merge).
     char_keys: list[set[str]] = []
     for ch in flat:
-        keys = _character_name_keys(ch)
+        if _character_appearance(ch) is None:
+            ch["appearance"] = 1
+        keys = _character_identity_keys(ch)
         if not keys:
             keys = {ch["id"]}
         char_keys.append(keys)
@@ -635,10 +767,10 @@ def merge_character_lists(batches: list[list[dict]]) -> list[dict]:
 
     # De-dupe dialogue chars that might still equal narrator by name
     final: list[dict] = [narrator]
-    narrator_keys = _character_name_keys(narrator) | {"narrator", "旁白"}
+    narrator_keys = _character_identity_keys(narrator) | {"narrator", "旁白"}
     seen_ids: set[str] = {"narrator"}
     for ch in merged_chars:
-        keys = _character_name_keys(ch)
+        keys = _character_identity_keys(ch)
         if keys & narrator_keys:
             continue
         if ch["id"] in seen_ids:
@@ -648,7 +780,49 @@ def merge_character_lists(batches: list[list[dict]]) -> list[dict]:
         seen_ids.add(ch["id"])
         final.append(validate_character(ch))
 
-    return final
+    return _cap_main_cast(final)
+
+
+def _cap_main_cast(characters: list[dict], limit: int = _MAX_MAIN_CAST) -> list[dict]:
+    """Keep narrator + at most ``limit`` dialogue leads; fold the rest into crowd."""
+    narrator: dict | None = None
+    dialogue: list[dict] = []
+    crowds: list[dict] = []
+    for ch in characters:
+        role = ch.get("role")
+        if role == "narrator" or ch.get("id") == "narrator":
+            narrator = ch
+        elif role == "crowd" or ch.get("id") == "crowd":
+            crowds.append(ch)
+        else:
+            dialogue.append(ch)
+
+    if any(_character_appearance(c) is not None for c in dialogue):
+        dialogue = [
+            c
+            for _, c in sorted(
+                enumerate(dialogue),
+                key=lambda iv: (-(_character_appearance(iv[1]) or 0), iv[0]),
+            )
+        ]
+
+    main = dialogue[:limit]
+    extras = dialogue[limit:]
+    if extras or crowds:
+        crowd = dict(crowds[0]) if crowds else dict(_DEFAULT_CROWD)
+        for other in extras + crowds[1:]:
+            crowd = _merge_two_characters(crowd, other)
+        crowd["id"] = "crowd"
+        crowd["role"] = "crowd"
+        if not crowd.get("name") or crowd["name"] in {"unknown", ""}:
+            crowd["name"] = "路人"
+        main.append(validate_character(crowd))
+
+    out: list[dict] = []
+    if narrator is not None:
+        out.append(narrator)
+    out.extend(main)
+    return out
 
 
 def _style_sample_text(text: str, chapters: list[dict]) -> str:
@@ -772,35 +946,70 @@ _CARD_TAIL = (
 )
 
 
+def _audio_path_exists(path: Any) -> bool:
+    """True when ``path`` names an existing file (usable TTS prompt)."""
+    if path is None:
+        return False
+    text = str(path).strip()
+    if not text or text.lower() in {"none", "null"}:
+        return False
+    try:
+        return Path(text).is_file()
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _parse_voice_bank_data(data: Any, base: Path) -> tuple[list[dict], list[str]]:
+    """Parse YAML voice-bank data; drop entries whose wav path is missing."""
+    if data is None:
+        return [], []
+    if isinstance(data, list):
+        voices = data
+    elif isinstance(data, dict):
+        voices = data.get("voices") or data.get("bank") or []
+    else:
+        return [], []
+
+    out: list[dict] = []
+    missing: list[str] = []
+    for item in voices:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        raw_path = entry.get("path")
+        if not raw_path:
+            missing.append(str(entry.get("id") or "(missing path)"))
+            continue
+        if "id" not in entry:
+            entry["id"] = Path(str(raw_path)).stem
+        candidate = Path(str(raw_path))
+        if candidate.is_file():
+            entry["path"] = str(candidate)
+            out.append(entry)
+            continue
+        alt = base / str(raw_path)
+        if alt.is_file():
+            entry["path"] = str(alt)
+            out.append(entry)
+            continue
+        missing.append(str(raw_path))
+    return out, missing
+
+
 def load_voice_bank(path: str) -> list[dict]:
     """
     Load seed voice entries from a YAML bank file.
 
     Expects ``{voices: [{id, path, gender, age, timbre, languages}, ...]}``
     or a bare list of the same dicts. Returns a list of plain dicts.
+    Entries whose ``path`` file does not exist (as given or relative to the
+    YAML directory) are dropped.
     """
     p = Path(path)
     with open(p, encoding="utf-8") as f:
         data = yaml.safe_load(f)
-
-    if data is None:
-        return []
-    if isinstance(data, list):
-        voices = data
-    elif isinstance(data, dict):
-        voices = data.get("voices") or data.get("bank") or []
-    else:
-        return []
-
-    out: list[dict] = []
-    for item in voices:
-        if not isinstance(item, dict):
-            continue
-        entry = dict(item)
-        if "id" not in entry and "path" in entry:
-            entry["id"] = Path(str(entry["path"])).stem
-        out.append(entry)
-    return out
+    entries, _missing = _parse_voice_bank_data(data, p.parent)
+    return entries
 
 
 def _is_narrator(char: dict) -> bool:
@@ -917,6 +1126,10 @@ def assign_seed_voices(
             char["seed_path"] = narrator_audio
             if not char.get("seed_voice_id"):
                 char["seed_voice_id"] = "narrator_custom"
+        elif not bank_list and narrator_audio:
+            char["seed_path"] = narrator_audio
+            if not char.get("seed_voice_id"):
+                char["seed_voice_id"] = "ref_audio"
         else:
             voice = _pick_seed_voice(char, bank_list, used)
             if voice is not None:
@@ -927,7 +1140,16 @@ def assign_seed_voices(
                     used.add(vid)
         result[i] = char
 
-    return [c if c is not None else dict(chars[i]) for i, c in enumerate(result)]
+    assigned = [c if c is not None else dict(chars[i]) for i, c in enumerate(result)]
+    if narrator_audio:
+        for i, char in enumerate(assigned):
+            if not char.get("seed_path"):
+                filled = dict(char)
+                filled["seed_path"] = narrator_audio
+                if not filled.get("seed_voice_id"):
+                    filled["seed_voice_id"] = "ref_audio"
+                assigned[i] = filled
+    return assigned
 
 
 def build_card_text(character: dict) -> str:
@@ -981,8 +1203,13 @@ def generate_character_voices(
             out.append(char)
             continue
 
-        if not seed_path:
-            char["ref_wav"] = None
+        if not _audio_path_exists(seed_path):
+            # Keep seed unresolved so Step 4 can retry; do not claim success.
+            char.pop("ref_wav", None)
+            print(
+                f"  [{cid}] skip voice card: seed WAV missing "
+                f"({seed_path!r})"
+            )
             out.append(char)
             continue
 
@@ -997,18 +1224,30 @@ def generate_character_voices(
             else:
                 base_emo = _normalize_base_emo(base_emo)
             emo_vector = tts.normalize_emo_vec(base_emo)
-            tts.infer(
-                spk_audio_prompt=seed_path,
-                text=card_text,
-                lang=lang,
-                output_path=ref_wav,
-                emo_vector=emo_vector,
-                duration_factor=1.0,
-                interval_silence=200,
-                max_text_tokens_per_segment=120,
-                use_random=False,
-                verbose=False,
-            )
+            try:
+                tts.infer(
+                    spk_audio_prompt=seed_path,
+                    text=card_text,
+                    lang=lang,
+                    output_path=ref_wav,
+                    emo_vector=emo_vector,
+                    duration_factor=1.0,
+                    interval_silence=200,
+                    max_text_tokens_per_segment=120,
+                    use_random=False,
+                    verbose=False,
+                )
+            except Exception as e:
+                print(f"  [{cid}] TTS failed ({e}), skip voice card")
+                char.pop("ref_wav", None)
+                out.append(char)
+                continue
+
+        if not Path(ref_wav).is_file():
+            print(f"  [{cid}] TTS produced no wav, skip voice card")
+            char.pop("ref_wav", None)
+            out.append(char)
+            continue
 
         char["ref_wav"] = ref_wav
         out.append(char)
@@ -1460,6 +1699,7 @@ def synthesize_chapter(
         ref_wav = character.get("ref_wav")
         tts_text = str(utt.get("tts_text") or utt.get("text") or "")
         lang = str(utt.get("lang") or "zh").strip().lower() or "zh"
+        utt_label = utt.get("id") or f"{chapter_id}_{seq:04d}"
 
         try:
             df = float(utt.get("duration_factor", character.get("duration_factor", 1.0)))
@@ -1468,8 +1708,22 @@ def synthesize_chapter(
         duration_factor = _clamp(df, _DURATION_FACTOR_MIN, _DURATION_FACTOR_MAX)
         emo_vector = _emo_for_infer(tts, utt.get("emo_vector"))
 
+        def _fail_silence(reason: str) -> None:
+            print(f"  [{utt_label}] {reason}")
+            if strict:
+                raise RuntimeError(reason)
+            silence_sec = max(1.2, 0.15 * len(tts_text))
+            _write_silence_wav(wav_path, silence_sec)
+
+        if not _audio_path_exists(ref_wav):
+            _fail_silence(
+                f"TTS skipped: missing speaker prompt {ref_wav!r}"
+            )
+            out.append(utt)
+            continue
+
         try:
-            tts.infer(
+            result = tts.infer(
                 spk_audio_prompt=ref_wav,
                 text=tts_text,
                 output_path=str(wav_path),
@@ -1480,11 +1734,19 @@ def synthesize_chapter(
                 max_text_tokens_per_segment=120,
                 use_random=False,
             )
-        except Exception:
+        except Exception as e:
+            print(f"  [{utt_label}] TTS failed ({e}), using silence placeholder")
             if strict:
                 raise
-            silence_sec = max(1.2, 0.15 * len(tts_text))
-            _write_silence_wav(wav_path, silence_sec)
+            if not wav_path.is_file():
+                silence_sec = max(1.2, 0.15 * len(tts_text))
+                _write_silence_wav(wav_path, silence_sec)
+            out.append(utt)
+            continue
+
+        if result is None or not wav_path.is_file():
+            if not wav_path.is_file():
+                _fail_silence("TTS returned no wav, using silence placeholder")
 
         out.append(utt)
 
@@ -1588,27 +1850,41 @@ def _filter_chapters(chapters: list[dict], chapter: int | None) -> list[dict]:
     return selected
 
 
-def _resolve_voice_bank(voice_bank: str | None) -> list[dict]:
+def _resolve_voice_bank_detailed(
+    voice_bank: str | None,
+) -> tuple[list[dict], list[str], str]:
+    """Load a voice bank, dropping missing wavs. Returns (kept, missing, source)."""
     p = Path(voice_bank) if voice_bank else Path(_DEFAULT_VOICE_BANK)
+    source = str(p)
     if p.is_dir():
         yamls = sorted(p.glob("*.yaml")) + sorted(p.glob("*.yml"))
         if not yamls:
-            return []
+            return [], [], source
         p = yamls[0]
+        source = str(p)
     if not p.is_file():
-        return []
-    bank = load_voice_bank(str(p))
-    base = p.parent
-    for entry in bank:
-        path = entry.get("path")
-        if not path:
-            continue
-        raw = Path(path)
-        if not raw.is_file():
-            alt = base / path
-            if alt.is_file():
-                entry["path"] = str(alt)
+        return [], [source], source
+    with open(p, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    bank, missing = _parse_voice_bank_data(data, p.parent)
+    return bank, missing, source
+
+
+def _resolve_voice_bank(voice_bank: str | None) -> list[dict]:
+    bank, _missing, _source = _resolve_voice_bank_detailed(voice_bank)
     return bank
+
+
+def _voices_need_retry(characters: list[dict], voices_dir: Path) -> bool:
+    """True when a seed wav exists but the card was not written (Step 4 retry)."""
+    if not (voices_dir / "manifest.json").is_file():
+        return True
+    for char in characters:
+        if _audio_path_exists(char.get("ref_wav")):
+            continue
+        if _audio_path_exists(char.get("seed_path")):
+            return True
+    return False
 
 
 def _all_scripts_exist(novel_dir: Path, chapters: list[dict]) -> bool:
@@ -1732,6 +2008,9 @@ def run_novel_pipeline(
     ``chapters.json`` and returns ``{"step": 1, ...}`` without loading TTS.
     LLM key is required from style onward. TTS is loaded only at voices/tts.
     """
+    if cleanup and chapter is not None:
+        raise ValueError("--cleanup cannot be used with --chapter")
+
     src_path = Path(input_path)
     if not src_path.is_file():
         raise FileNotFoundError(f"input not found: {input_path}")
@@ -1852,15 +2131,21 @@ def run_novel_pipeline(
 
         # Step 4 voice cards (load TTS)
         manifest_path = voices_dir / "manifest.json"
-        if done < 4 or not manifest_path.is_file():
+        need_voices = done < 4 or not manifest_path.is_file()
+        if not need_voices and characters:
+            need_voices = _voices_need_retry(characters, voices_dir)
+        if need_voices:
             print("\n[Step 4] Assigning seeds and generating voice cards...")
-            bank = _resolve_voice_bank(voice_bank)
+            bank, missing_seeds, bank_source = _resolve_voice_bank_detailed(voice_bank)
             narr_src = narrator_audio or ref_audio
-            if not bank and not narr_src:
-                raise ValueError(
-                    "voice bank or --ref-audio/--narrator-audio is required "
-                    "to generate character voices"
-                )
+            if not bank:
+                if not _audio_path_exists(narr_src):
+                    missing_txt = ", ".join(missing_seeds) if missing_seeds else bank_source
+                    raise ValueError(
+                        "No usable seed WAV files in the voice bank; "
+                        "pass --ref-audio to use as the seed for every role. "
+                        f"Missing files: {missing_txt}"
+                    )
             characters = _apply_style_voice_defaults(characters, style)
             characters = assign_seed_voices(characters, bank, narrator_audio=narr_src)
             characters = generate_character_voices(
@@ -1869,8 +2154,9 @@ def run_novel_pipeline(
             _write_json(characters_path, characters)
             paths["voices"] = str(voices_dir)
             paths["characters"] = str(characters_path)
-            done = 4
-            _save_novel_checkpoint(novel_dir, done, paths)
+            if not _voices_need_retry(characters, voices_dir):
+                done = 4
+                _save_novel_checkpoint(novel_dir, done, paths)
         else:
             characters = _read_json(characters_path)
             print("[Step 4] Skipped (cached voice cards)")
@@ -2025,7 +2311,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cleanup", action="store_true",
-        help="Delete work dir after success; keep --output chapter wavs",
+        help="Delete work dir after success; keep --output chapter wavs "
+             "(cannot be combined with --chapter)",
     )
     return parser
 
@@ -2034,6 +2321,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     llm_key = args.llm_api_key or os.environ.get("LLM_API_KEY")
+    if args.cleanup and args.chapter is not None:
+        parser.error("--cleanup cannot be used with --chapter")
     if args.stop_after not in {"chapters"} and not llm_key:
         parser.error(
             "LLM API key required for this run. "

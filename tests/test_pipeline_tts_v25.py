@@ -105,10 +105,12 @@ def test_novel_synthesize_uses_lang_zh(tmp_path, monkeypatch):
             Path(p).parent.mkdir(parents=True, exist_ok=True)
             Path(p).write_bytes(b"RIFF")
 
+    ref = tmp_path / "ref.wav"
+    ref.write_bytes(b"RIFF")
     utts = [{
         "chapter_id": "c01", "seq": 0, "speaker_id": "narrator",
         "tts_text": "你好", "lang": "zh", "emo_vector": [0] * 8,
         "duration_factor": 1.0, "silence_after_ms": 200,
     }]
-    synthesize_chapter(utts, {"narrator": {"ref_wav": "ref.wav"}}, FakeTTS(), str(tmp_path))
+    synthesize_chapter(utts, {"narrator": {"ref_wav": str(ref)}}, FakeTTS(), str(tmp_path))
     assert recorded.get("lang") == "zh"
